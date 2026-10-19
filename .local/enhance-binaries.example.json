@@ -1,0 +1,31 @@
+{
+  "allowed_binary_roots": {
+    "ffmpeg": ["<ffmpeg-root>"],
+    "ffprobe": ["<ffmpeg-root>"],
+    "realesrgan-ncnn-vulkan": ["<realesrgan-root>"],
+    "rife-ncnn-vulkan": ["<rife-root>"]
+  },
+  "expected_sha256": {
+    "ffmpeg": [],
+    "ffprobe": [],
+    "realesrgan-ncnn-vulkan": ["<sha256-hex>"],
+    "rife-ncnn-vulkan": ["<sha256-hex>"]
+  },
+  "roots": {
+    "codeformer-local": "<codeformer-root>"
+  },
+  "executables": {
+    "codeformer-python": "<codeformer-venv>\\Scripts\\python.exe"
+  },
+  "models": {
+    "codeformer": {
+      "path": "<codeformer-root>\\weights\\CodeFormer\\codeformer.pth"
+    },
+    "facelib_detection": {
+      "path": "<codeformer-root>\\weights\\facelib\\detection_Resnet50_Final.pth"
+    },
+    "facelib_parsing": {
+      "path": "<codeformer-root>\\weights\\facelib\\parsing_parsenet.pth"
+    }
+  }
+}

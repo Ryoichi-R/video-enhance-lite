@@ -1,0 +1,33 @@
+name: video-enhance-lite-ci
+
+# video-enhance-lite は pyproject.toml に "Windows-local pipeline" と明記された
+# Windows 専用ツールであり、tests/enhance/test_gui*.py が tkinter を直接 import する。
+# Linux runner では python3-tk + xvfb が別途必要で煩雑なため、CI は windows-latest のみで回す。
+# （tkinter は Windows の CPython に標準同梱され、headless でも Tk() が起動できる）
+on:
+    pull_request:
+    push:
+        branches: [main]
+
+jobs:
+    pytest:
+        name: pytest (windows)
+        runs-on: windows-latest
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Python セットアップ
+              uses: actions/setup-python@v6
+              with:
+                  python-version: '3.13'
+
+            - name: '依存インストール（dev + enhance extras: pytest / ruff / numpy / opencv-python-headless）'
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install -e ".[dev,enhance]"
+
+            - name: 'ruff lint（最小ゲート: F=pyflakes / E9=構文エラー）'
+              run: python -m ruff check src tests --select F,E9
+
+            - name: pytest 実行
+              run: python -m pytest tests -q

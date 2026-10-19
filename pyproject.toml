@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-enhance-lite"
+version = "0.2.0"
+description = "Windows-local video enhancement pipeline with explicit optional external engines."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.14"
+keywords = ["video", "enhancement", "upscale", "ffmpeg", "windows"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=8", "ruff>=0.6"]
+enhance = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10",
+]
+
+[project.scripts]
+video-enhance-lite = "video_enhance_lite.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = [
+    "e2e: real external-binary contract tests (skip when ffmpeg is not on PATH; RIFE layout check needs VIDEO_ENHANCE_E2E_RIFE_DIR)",
+    "gui: tkinter tests that require a working display",
+    "requires_display: test requires a working tkinter display",
+    "release: public-candidate and package boundary checks",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# 初回ゲートは最小セット (F=pyflakes / E9=構文エラー) に限定する。
+# 構文エラー・未定義名・重大な import 問題を拾う。S / BLE / 広範な style は
+# 既存違反が出やすいため、lint 範囲拡張時 (別 PR) に有効化する。
+select = ["F", "E9"]
+
+[tool.ruff.lint.per-file-ignores]
+# テストは共有 fixture (workspace / fake_run) を tests/enhance/test_pipeline から
+# import し、各テスト関数の引数で受け取る pytest 標準パターンを使う。pyflakes は
+# 「fixture 定義の import を引数で再定義している」と誤検出するため F811 を除外する。
+# (恒久対応として fixture の conftest.py 集約が望ましいが、本 PR の範囲外。)
+"tests/**" = ["F811"]

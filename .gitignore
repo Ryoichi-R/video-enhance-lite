@@ -1,0 +1,67 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+settings.local.json
+*.local.json
+.local/*
+!.local/enhance-binaries.example.json
+
+# Runtime data
+input/
+output/
+temp/
+tmp/
+work/
+frames/
+logs/
+*.log
+
+# Media
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+*.wav
+
+# Models and third-party binaries
+models/
+weights/
+third_party/bin/
+realesrgan-ncnn-vulkan-*/
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.param
+*.bin
+*.exe
+*.dll
+*.pdb
+ffmpeg.exe
+ffprobe.exe
+realesrgan-ncnn-vulkan.exe
+
+# Internal-only material
+_internal/
+
+# IDE / OS
+.vscode/*
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
