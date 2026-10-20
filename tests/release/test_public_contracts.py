@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -13,8 +14,12 @@ from video_enhance_lite.deps import MissingDependencyError
 
 pytestmark = pytest.mark.release
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="asserts Windows-specific path and executable resolution"
+)
 
 
+@windows_only
 def test_runtime_roots_are_independent_from_project_root(monkeypatch, tmp_path):
     app_root = tmp_path / "ユーザー data" / "video-enhance-lite"
     config_root = app_root / "config"
@@ -70,6 +75,7 @@ def test_dependency_error_has_structured_remediation(tmp_path):
     assert payload["remediation"] == ["configure the binary root"]
 
 
+@windows_only
 def test_find_executable_prefers_explicit_allowed_root(tmp_path, monkeypatch):
     explicit = tmp_path / "explicit"
     explicit.mkdir()
