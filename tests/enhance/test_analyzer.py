@@ -222,7 +222,7 @@ def test_extract_samples_skips_only_missing_final_sample(monkeypatch, tmp_path):
     warnings: list[str] = []
     progress: list[tuple[int, int]] = []
 
-    def _fake_run(argv):
+    def _fake_run(argv, **kwargs):
         out_path = Path(argv[-1])
         if out_path.name != "sample_0003.png":
             out_path.touch()
@@ -251,7 +251,7 @@ def test_extract_samples_skips_only_missing_final_sample(monkeypatch, tmp_path):
 
 
 def test_extract_samples_keeps_nonfinal_missing_sample_fatal(monkeypatch, tmp_path):
-    def _fake_run(argv):
+    def _fake_run(argv, **kwargs):
         out_path = Path(argv[-1])
         if out_path.name != "sample_0001.png":
             out_path.touch()
@@ -406,7 +406,16 @@ def test_analyze_end_to_end(monkeypatch, tmp_path):
 
     # _extract_samples をモックして実際に numpy 画像をファイルに書く
     def _fake_extract(
-        ffmpeg, input_path, duration_sec, sample_count, out_dir, cancel_event, progress, warning
+        ffmpeg,
+        input_path,
+        duration_sec,
+        sample_count,
+        out_dir,
+        cancel_event,
+        progress,
+        warning,
+        start_offset_sec=0.0,
+        per_stream_timestamp_rebase=False,
     ):
         import cv2
 
@@ -455,7 +464,16 @@ def test_analyze_face_candidate_timestamps_survive_unreadable_sample(monkeypatch
     }
 
     def _fake_extract(
-        ffmpeg, input_path, duration_sec, sample_count, out_dir, cancel_event, progress, warning
+        ffmpeg,
+        input_path,
+        duration_sec,
+        sample_count,
+        out_dir,
+        cancel_event,
+        progress,
+        warning,
+        start_offset_sec=0.0,
+        per_stream_timestamp_rebase=False,
     ):
         import cv2
 
@@ -512,7 +530,16 @@ def test_analyze_keep_samples(monkeypatch, tmp_path):
     monkeypatch.setattr(analyzer, "_run", _fake_ffprobe_factory(video, {"streams": []}))
 
     def _fake_extract(
-        ffmpeg, input_path, duration_sec, sample_count, out_dir, cancel_event, progress, warning
+        ffmpeg,
+        input_path,
+        duration_sec,
+        sample_count,
+        out_dir,
+        cancel_event,
+        progress,
+        warning,
+        start_offset_sec=0.0,
+        per_stream_timestamp_rebase=False,
     ):
         import cv2
 

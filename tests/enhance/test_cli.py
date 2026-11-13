@@ -680,6 +680,68 @@ def test_main_auto_with_enable_exits_zero(monkeypatch, tmp_path, capsys):
     assert by["grain"].enabled is True
 
 
+def test_auto_mode_explicit_disable_is_not_deferred():
+    """--disable で明示的に不採用としたステージは保留せず OFF にする。"""
+    decs = decisions_mod.recommend(
+        FakeMeta(width=640, field_order="tt"),
+        FakeStats(highfreq_energy=config.T_NOISE + 5.0),  # denoise + grain 推奨
+    )
+    decs, deferred = cli._apply_auto_mode(decs, explicit_disable={"denoise", "grain"})
+    by = decisions_mod.decisions_by_key(decs)
+    assert by["denoise"].enabled is False
+    assert by["grain"].enabled is False
+    assert "denoise" not in deferred
+    assert "grain" not in deferred
+
+
+def test_auto_mode_disable_wins_over_enable():
+    """_apply_forced_overrides と同じく disable を enable より優先する。"""
+    decs = decisions_mod.recommend(
+        FakeMeta(width=640), FakeStats(highfreq_energy=config.T_NOISE + 5.0)
+    )
+    decs, deferred = cli._apply_auto_mode(
+        decs, explicit_enable={"denoise"}, explicit_disable={"denoise"}
+    )
+    assert decisions_mod.decisions_by_key(decs)["denoise"].enabled is False
+    assert "denoise" not in deferred
+
+
+def test_main_auto_with_disable_exits_zero(monkeypatch, tmp_path):
+    """--auto --disable <保留ステージ全部> で exit 1 にならず pipeline まで到達する。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+    input_path = tmp_path / "in.mp4"
+    input_path.write_bytes(b"")
+
+    from video_enhance_lite import analyzer
+    from video_enhance_lite import deps as ven_deps
+    from video_enhance_lite import pipeline as ven_pipeline
+
+    monkeypatch.setattr(
+        ven_deps,
+        "check_ffmpeg",
+        lambda: ven_deps.ResolvedBinary(path=Path(r"C:\bin\ffmpeg.exe"), version="n", sha256=None),
+    )
+    monkeypatch.setattr(
+        ven_deps,
+        "check_ffprobe",
+        lambda: ven_deps.ResolvedBinary(path=Path(r"C:\bin\ffprobe.exe"), version="n", sha256=None),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "analyze",
+        lambda **kw: (FakeMeta(width=1920), FakeStats(highfreq_energy=config.T_NOISE + 5.0)),
+    )
+    captured: dict = {}
+    monkeypatch.setattr(ven_pipeline, "run_pipeline", lambda **kw: captured.update(kw))
+
+    rc = cli.main([str(input_path), "--auto", "--disable", "denoise,grain", "--no-rife"])
+
+    assert rc == 0
+    by = decisions_mod.decisions_by_key(captured["decisions"])
+    assert by["denoise"].enabled is False
+    assert by["grain"].enabled is False
+
+
 def test_main_unknown_framerate_allows_analysis_but_fails_before_pipeline(
     monkeypatch,
     tmp_path,

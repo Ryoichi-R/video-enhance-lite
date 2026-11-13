@@ -165,6 +165,7 @@ class CapabilityDiagnostic:
 
 
 _VERSION_HASH_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB 以下のみ sha256 取得
+_CAPTURE_TIMEOUT_SEC = 30
 
 
 def _run_capture(argv: list[str]) -> str | None:
@@ -178,6 +179,8 @@ def _run_capture(argv: list[str]) -> str | None:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            # A hung executable must not block start-up; treat it as unusable.
+            timeout=_CAPTURE_TIMEOUT_SEC,
             creationflags=_HIDE_WINDOW_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):

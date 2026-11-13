@@ -253,6 +253,21 @@ def recommend(
         )
 
     # 6. color_correction
+    # Conservative adjustments toward the accepted range, not full histogram
+    # normalization. Clipped detail cannot be recovered by an exposure filter.
+    brightness = config.DEFAULT_COLOR_BRIGHTNESS
+    contrast = config.DEFAULT_COLOR_CONTRAST
+    saturation = config.DEFAULT_COLOR_SATURATION
+    if stats.luma_mean < t_luma_dark:
+        brightness = min(0.15, (t_luma_dark - stats.luma_mean) / 255.0)
+    elif stats.luma_mean > t_luma_bright:
+        brightness = max(-0.15, (t_luma_bright - stats.luma_mean) / 255.0)
+    if stats.luma_clipping_ratio > t_luma_clip:
+        contrast = 0.95
+    # Leave monochrome material monochrome; do not recommend a saturation-only
+    # operation that cannot change zero chroma.
+    if 1.0 < stats.saturation_mean < t_sat_low:
+        saturation = min(1.25, t_sat_low / stats.saturation_mean)
     color_reasons: list[str] = []
     if stats.luma_mean < t_luma_dark:
         color_reasons.append(f"luma_mean={stats.luma_mean:.1f} < {t_luma_dark} (暗め)")
@@ -262,7 +277,7 @@ def recommend(
         color_reasons.append(
             f"luma_clipping_ratio={stats.luma_clipping_ratio:.3f} > {t_luma_clip} (潰れ)"
         )
-    if stats.saturation_mean < t_sat_low:
+    if 1.0 < stats.saturation_mean < t_sat_low:
         color_reasons.append(f"saturation_mean={stats.saturation_mean:.1f} < {t_sat_low} (低彩度)")
     if color_reasons:
         decisions.append(
@@ -272,9 +287,9 @@ def recommend(
                 confidence="medium",
                 reason="; ".join(color_reasons),
                 params={
-                    "brightness": config.DEFAULT_COLOR_BRIGHTNESS,
-                    "contrast": config.DEFAULT_COLOR_CONTRAST,
-                    "saturation": config.DEFAULT_COLOR_SATURATION,
+                    "brightness": brightness,
+                    "contrast": contrast,
+                    "saturation": saturation,
                 },
             )
         )

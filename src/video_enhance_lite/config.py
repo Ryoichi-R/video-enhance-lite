@@ -87,6 +87,25 @@ def validate_output_path(output_path: Path) -> Path:
         raise ValueError(f"cannot resolve output path: {output_path}") from e
 
 
+def prepare_output_path(output_path: Path) -> Path:
+    """Create and test the destination directory before expensive processing.
+
+    Probe with a separate temporary file; never truncate an existing output.
+    Analysis-only callers must continue to use validate_output_path instead.
+    """
+    output_path = validate_output_path(output_path)
+    try:
+        if output_path.is_dir():
+            raise ValueError(f"output path is a directory: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=output_path.parent) as probe:
+            probe.write(b"video-enhance-lite output preflight")
+            probe.flush()
+    except OSError as exc:
+        raise ValueError(f"cannot write to output directory: {output_path.parent}: {exc}") from exc
+    return output_path
+
+
 __all__ = [
     "PROJECT_ROOT",
     "WORKSPACE_ROOT",
@@ -101,6 +120,7 @@ __all__ = [
     "get_default_output_root",
     "validate_chunk_seconds",
     "validate_output_path",
+    "prepare_output_path",
     "is_output_directory",
     "make_unique_output_path",
     "DEFAULT_CHUNK_SECONDS",
@@ -155,6 +175,7 @@ __all__ = [
     "DEFAULT_DENOISE_STRENGTH",
     "DEFAULT_DEBAND_RANGE",
     "DEFAULT_FLICKER_SIZE",
+    "DEFAULT_ANALYZE_PROCESS_TIMEOUT_SEC",
     "DEFAULT_COLOR_BRIGHTNESS",
     "DEFAULT_COLOR_CONTRAST",
     "DEFAULT_COLOR_SATURATION",
@@ -227,6 +248,8 @@ FACE_RESTORE_BACKENDS = ("codeformer-local",)
 DEFAULT_FACE_RESTORE_BACKEND = "codeformer-local"
 DEFAULT_FACE_RESTORE_FIDELITY = 0.8
 DEFAULT_FACE_RESTORE_IDLE_TIMEOUT_SEC = 3000
+# Upper bound for one ffprobe/ffmpeg call during analysis (probe or one sample).
+DEFAULT_ANALYZE_PROCESS_TIMEOUT_SEC = 120
 DEFAULT_FACE_RESTORE_DETECTION_MODEL = "retinaface_resnet50"
 FACE_RESTORE_MASK_MODES = ("none", "diff")
 DEFAULT_FACE_RESTORE_BLEND = 1.0
@@ -647,7 +670,7 @@ def is_output_directory(path: Path) -> bool:
 
 
 def make_unique_output_path(path: Path) -> Path:
-    if not path.exists():
+    if not (path.exists() or path.is_symlink()):
         return path
     stem = path.stem
     suffix = path.suffix
@@ -655,7 +678,7 @@ def make_unique_output_path(path: Path) -> Path:
     index = 1
     while True:
         candidate = parent / f"{stem}~({index}){suffix}"
-        if not candidate.exists():
+        if not (candidate.exists() or candidate.is_symlink()):
             return candidate
         index += 1
 

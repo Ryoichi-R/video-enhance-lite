@@ -1816,7 +1816,7 @@ class App:
                     if face_dec_local is not None
                     else pipeline.FaceRestoreOptions()
                 )
-                pipeline.run_pipeline(
+                saved_path = pipeline.run_pipeline(
                     input_path=input_path,
                     output_path=output_path,
                     decisions=decs_local,
@@ -1839,7 +1839,7 @@ class App:
                     temp_run=self._temp_run,
                     estimated_peak_temp_bytes=math.ceil(peak_gib * (1024**3)),
                 )
-                self._eventq.write(f"[OK] saved: {output_path}")
+                self._eventq.write(f"[OK] saved: {saved_path or output_path}")
                 self._eventq.finish(_FinishEvent("success"))
             except pipeline.PipelineCancelled as e:
                 self._eventq.write(f"[CANCELLED] {e}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import ctypes
 import errno
 import math
 import os
@@ -753,6 +754,73 @@ def _atomic_replace_from_file(src: Path, dst: Path) -> None:
     _link_or_copy_atomic(src, dst)
 
 
+def _partial_output_path(output_path: Path) -> Path:
+    # Same directory (same filesystem) so publishing is a link/rename, and the
+    # original suffix so FFmpeg selects the same muxer.
+    return output_path.with_name(
+        f"{output_path.stem}.partial-{secrets.token_hex(4)}{output_path.suffix}"
+    )
+
+
+def _rename_without_overwrite(source: Path, destination: Path) -> None:
+    """Atomically rename or fail if the destination exists, including dangling links.
+
+    Windows rename already has this contract. POSIX rename/replace does not;
+    use native exclusive rename where available and otherwise keep the partial.
+    """
+    if sys.platform == "win32":
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        args = (os.fsencode(source), os.fsencode(destination), 0x4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        args = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", str(destination))
+    rename.restype = ctypes.c_int
+    if rename(*args) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def _publish_output_without_overwrite(temporary: Path, output_path: Path) -> Path:
+    """Move a completed output into place; never replace a file that appeared meanwhile.
+
+    The output name is chosen before processing starts, so another run or the
+    user may have created the same name during a long job. Returns the final path.
+    """
+    candidate = output_path
+    while True:
+        try:
+            os.link(temporary, candidate)
+        except FileExistsError:
+            candidate = config.make_unique_output_path(output_path)
+            continue
+        except OSError:
+            # No check-then-replace: a competing writer may claim the name at
+            # any time. Both publication paths must reject existing entries.
+            try:
+                _rename_without_overwrite(temporary, candidate)
+            except FileExistsError:
+                candidate = config.make_unique_output_path(output_path)
+                continue
+            return candidate
+        temporary.unlink(missing_ok=True)
+        return candidate
+
+
 def _read_image_path_safe(path: Path, flags: int):
     try:
         import cv2  # type: ignore
@@ -1275,6 +1343,8 @@ def _process_chunk(
     debug_split_postfilter: bool = False,
     fuse_extract_prefilter: bool = False,
     keep_temp: bool = False,
+    source_start_offset_sec: float = 0.0,
+    per_stream_timestamp_rebase: bool = False,
 ) -> Path:
     tag = f"[chunk {chunk_idx + 1}/{total_chunks}]"
     by = decisions_by_key(decisions)
@@ -1344,6 +1414,8 @@ def _process_chunk(
         vf_chain=fused_chain,
         normalization_fps=normalization_fps,
         expected_frame_count=expected_normalized_frames,
+        video_start_offset_sec=source_start_offset_sec,
+        per_stream_timestamp_rebase=per_stream_timestamp_rebase,
     )
     _run_ffmpeg_png_stage(
         extract_argv,
@@ -1860,21 +1932,37 @@ def _concat_chunks(
     log: Callable[[str], None],
     cancel_event: threading.Event | None = None,
     io_idle_timeout_sec: int = DEFAULT_IO_IDLE_TIMEOUT_SEC,
-) -> None:
+    video_itsoffset_sec: float = 0.0,
+    source_itsoffset_sec: float = 0.0,
+) -> Path:
+    """Mux the chunks with the source streams; return the published output path.
+
+    FFmpeg writes to a partial file beside the output. A failed or cancelled run
+    removes it, so the final name only ever holds a complete file.
+    """
     list_path = chunks_dir / "concat_list.txt"
     lines = [f"file '{p.name}'\n" for p in chunk_paths]
     list_path.write_text("".join(lines), encoding="utf-8")
+    partial_path = _partial_output_path(output_path)
+    keep_partial = False
 
     log(f"[concat] ({len(chunk_paths)} chunks) -> {output_path}")
-    argv: list[str] = [
-        str(ffmpeg),
-        "-y",
+    argv: list[str] = [str(ffmpeg), "-y"]
+    # Chunks start at 0. These shifts restore the source's video start relative
+    # to the audio/subtitle streams taken from input 1 (see _mux_alignment).
+    if video_itsoffset_sec > 0:
+        argv += ["-itsoffset", f"{video_itsoffset_sec:.6f}"]
+    argv += [
         "-f",
         "concat",
         "-safe",
         "0",
         "-i",
         list_path.name,
+    ]
+    if source_itsoffset_sec > 0:
+        argv += ["-itsoffset", f"{source_itsoffset_sec:.6f}"]
+    argv += [
         "-i",
         str(input_path),
         "-map",
@@ -1919,16 +2007,55 @@ def _concat_chunks(
                 disposition,
             ]
     argv += ["-t", f"{duration_sec:.6f}"]
-    argv += [str(output_path)]
+    argv += [str(partial_path)]
     argv = _augment_ffmpeg_with_progress(argv)
-    runner.run_with_progress(
-        argv,
-        cwd=chunks_dir,
-        idle_timeout=io_idle_timeout_sec,
-        cancel_event=cancel_event,
-        on_progress=None,
-        stage="concat",
-    )
+    try:
+        runner.run_with_progress(
+            argv,
+            cwd=chunks_dir,
+            idle_timeout=io_idle_timeout_sec,
+            cancel_event=cancel_event,
+            on_progress=None,
+            stage="concat",
+        )
+        if not partial_path.is_file():
+            raise PipelineError("concat", f"ffmpeg produced no output: {partial_path}")
+        try:
+            return _publish_output_without_overwrite(partial_path, output_path)
+        except OSError as exc:
+            # The mux finished; keep the result rather than discard hours of work.
+            keep_partial = True
+            raise PipelineError(
+                "concat",
+                f"finished output could not be moved to {output_path}; it was kept at "
+                f"{partial_path}: {exc}",
+            ) from exc
+    finally:
+        if not keep_partial:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError as exc:
+                log(f"[WARN] could not remove partial output {partial_path}: {exc}")
+
+
+def _mux_alignment(meta, video_duration: float) -> tuple[float, float, float]:
+    """Return (video shift, source shift, output duration) for the final mux.
+
+    Offsets are relative to the container start. For input 1, FFmpeg normally
+    rebases on the container start; for MPEG-TS/PS it rebases on the earliest
+    stream actually used (audio/subtitles), so that becomes the reference.
+    """
+    video_offset = float(getattr(meta, "video_start_offset_sec", 0.0) or 0.0)
+    preserved_offset = getattr(meta, "preserved_streams_start_offset_sec", None)
+    source_reference = 0.0
+    if getattr(meta, "per_stream_timestamp_rebase", False) and preserved_offset is not None:
+        source_reference = float(preserved_offset)
+    shift = video_offset - source_reference
+    video_end = video_offset + video_duration
+    container_end = getattr(meta, "container_duration_sec", None) or video_end
+    output_start = min(video_offset, source_reference)
+    output_duration = max(video_end, container_end) - output_start
+    return max(0.0, shift), max(0.0, -shift), output_duration
 
 
 def run_pipeline(
@@ -1970,8 +2097,11 @@ def run_pipeline(
     hw_encode: str = "none",
     temp_run: temp_workspace.TempRunContext | None = None,
     estimated_peak_temp_bytes: int | None = None,
-) -> None:
-    """Run the hybrid 4-pass enhance pipeline.
+) -> Path:
+    """Run the hybrid 4-pass enhance pipeline and return the saved output path.
+
+    The returned path differs from `output_path` only when that name was taken
+    while processing (the existing file is never overwritten).
 
     `decisions` は事前に確定済み (analyze + user confirm 後)。
     `meta` は probe 結果。fps/duration の再取得を避けるため呼び出し側が渡す。
@@ -1991,11 +2121,18 @@ def run_pipeline(
     if cancel_event is None:
         cancel_event = threading.Event()
     config.validate_chunk_seconds(chunk_seconds)
+    # Later subprocesses change cwd (notably concat); resolve the source once.
+    input_path = Path(input_path).resolve()
     # Resolve once before passing the path to ffmpeg.
     output_path = config.validate_output_path(Path(output_path))
 
     stream_plan = resolve_stream_preservation(meta, log=log)
     framerate_plan = resolve_framerate_normalization(meta, log=log)
+
+    try:
+        output_path = config.prepare_output_path(output_path)
+    except ValueError as exc:
+        raise PipelineError("output_preflight", str(exc)) from exc
 
     by = decisions_by_key(decisions)
     encode_dec = by.get("encode")
@@ -2066,6 +2203,9 @@ def run_pipeline(
     fps = Fraction(meta.fps)
     has_audio = stream_plan.has_audio
     duration = float(meta.duration_sec)
+    video_start_offset = float(getattr(meta, "video_start_offset_sec", 0.0) or 0.0)
+    if not math.isfinite(video_start_offset) or video_start_offset < 0:
+        raise ValueError(f"invalid video start offset: {video_start_offset!r}")
 
     ranges = _compute_chunk_ranges(duration, chunk_seconds)
     log(
@@ -2199,6 +2339,8 @@ def run_pipeline(
                 and getattr(meta, "framerate_status", "unknown") == "cfr"
             ),
             keep_temp=keep_temp,
+            source_start_offset_sec=video_start_offset,
+            per_stream_timestamp_rebase=bool(getattr(meta, "per_stream_timestamp_rebase", False)),
         )
         _emit_progress(
             progress,
@@ -2243,19 +2385,26 @@ def run_pipeline(
 
         _check_cancel(cancel_event, "concat")
         _emit_progress(progress, "concat", total_chunks=len(ranges), label="concatenating")
-        _concat_chunks(
+        video_shift, source_shift, output_duration = _mux_alignment(meta, duration)
+        saved_path = _concat_chunks(
             runner=runner,
             ffmpeg=ffmpeg,
             chunks_dir=tmp_dirs["chunks"],
             chunk_paths=chunk_paths,
             input_path=input_path,
             stream_plan=stream_plan,
-            duration_sec=duration,
+            # Processing follows the video duration. Muxing retains leading and
+            # trailing audio/subtitles on the original container timeline.
+            duration_sec=output_duration,
             output_path=output_path,
             log=log,
             cancel_event=cancel_event,
             io_idle_timeout_sec=io_idle_timeout_sec,
+            video_itsoffset_sec=video_shift,
+            source_itsoffset_sec=source_shift,
         )
+        if saved_path != output_path:
+            log(f"[WARN] {output_path} appeared during processing; saved as {saved_path}")
         log("[pipeline] done")
         _emit_progress(progress, "done", total_chunks=len(ranges), label="done")
         succeeded = True
@@ -2271,3 +2420,4 @@ def run_pipeline(
                 temp_workspace.cleanup_temp_run(temp_run)
             except temp_workspace.TempWorkspaceError as exc:
                 log(f"[WARN] cleanup failed; temporary files remain at {tmp_root}: {exc}")
+    return saved_path

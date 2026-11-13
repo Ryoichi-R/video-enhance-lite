@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-enhance-lite"
-version = "0.2.0"
+version = "0.2.3"
 description = "Windows-local video enhancement pipeline with explicit optional external engines."
 readme = "README.md"
 license = "MIT"

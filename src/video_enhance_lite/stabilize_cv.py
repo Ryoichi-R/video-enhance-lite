@@ -8,7 +8,9 @@ ffmpeg N-120725+ で vidstabtransform が FAIL する既知問題 (TODO.md V1-1)
      前フレームとの affine 変換 (dx, dy, da) を推定
   2. 全フレームの累積軌跡を smoothing_radius の moving average で平滑化
   3. 各フレームに「smoothed - raw」の補正 affine を適用 (cv2.warpAffine)
-  4. crop_border=True なら ~5% 内側クロップ + 元サイズへ scale 戻し
+     回転は画像中心まわりで表す。左上原点まわりだと回転が平行移動成分に混ざり、
+     平滑化後の補正がずれる (回転揺れの残差が大きくなる)。
+  4. crop_border=True なら各辺 4% 内側クロップ + 元サイズへ scale 戻し
   5. frames_out/<同名>.png に書き出し
 """
 
@@ -29,6 +31,13 @@ __all__ = [
 DEFAULT_SMOOTHING_RADIUS = 30
 
 
+def _rotation_about_center(da: float, w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return (rotation matrix, centre) for an image of size w x h."""
+    c = np.array([(w - 1) / 2.0, (h - 1) / 2.0])
+    rot = np.array([[np.cos(da), -np.sin(da)], [np.sin(da), np.cos(da)]])
+    return rot, c
+
+
 def _sorted_pngs(frames_in: Path) -> list[Path]:
     return sorted(p for p in frames_in.iterdir() if p.suffix.lower() == ".png")
 
@@ -39,7 +48,8 @@ def _estimate_transforms(
 ) -> np.ndarray:
     """Return Nx3 ndarray of (dx, dy, da) raw inter-frame transforms.
 
-    First row is (0,0,0) by convention (no previous frame).
+    (dx, dy) is the translation that remains after rotating by `da` about the
+    image centre. First row is (0,0,0) by convention (no previous frame).
     """
     if len(files) < 2:
         raise ValueError(f"need at least 2 frames, got {len(files)}")
@@ -87,9 +97,11 @@ def _estimate_transforms(
             prev = curr
             continue
 
-        dx = float(m[0, 2])
-        dy = float(m[1, 2])
         da = float(np.arctan2(m[1, 0], m[0, 0]))
+        # estimateAffinePartial2D rotates about the origin: x' = R x + t.
+        # Rewrite as x' = R (x - c) + c + t_c, i.e. t_c = t - c + R c.
+        rot, c = _rotation_about_center(da, curr.shape[1], curr.shape[0])
+        dx, dy = (m[:, 2] - c + rot @ c).tolist()
         transforms[i] = (dx, dy, da)
         prev = curr
 
@@ -117,12 +129,12 @@ def _apply_transform_to_frame(
     crop_border: bool,
 ) -> np.ndarray:
     h, w = frame.shape[:2]
-    cos_a = np.cos(da)
-    sin_a = np.sin(da)
-    m = np.array([[cos_a, -sin_a, dx], [sin_a, cos_a, dy]], dtype=np.float64)
+    rot, c = _rotation_about_center(da, w, h)
+    t = c - rot @ c + np.array([dx, dy])
+    m = np.array([[rot[0, 0], rot[0, 1], t[0]], [rot[1, 0], rot[1, 1], t[1]]], dtype=np.float64)
     stabilized = cv2.warpAffine(frame, m, (w, h), borderMode=cv2.BORDER_REPLICATE)
     if crop_border:
-        # 約 5% 内側クロップ + 元サイズへ scale back
+        # 各辺 4% 内側クロップ + 元サイズへ scale back
         crop_x = int(w * 0.04)
         crop_y = int(h * 0.04)
         if crop_x > 0 and crop_y > 0 and w - 2 * crop_x > 0 and h - 2 * crop_y > 0:
@@ -146,7 +158,7 @@ def stabilize_chunk(
         frames_in: directory containing input PNG frames (named in lex order).
         frames_out: directory to write stabilized PNGs (created if missing).
         smoothing_radius: moving-average radius for trajectory smoothing.
-        crop_border: if True, crop ~5% inner border and rescale to original size
+        crop_border: if True, crop a 4% inner border and rescale to original size
                      (avoids visible black borders after warp).
         cancel_event: optional Event to abort processing.
         on_progress: optional callback (frame_index, total) for progress reporting.
@@ -164,7 +176,9 @@ def stabilize_chunk(
     trajectory = np.cumsum(raw, axis=0)
     smoothed = _smooth_trajectory(trajectory, smoothing_radius)
     diff = smoothed - trajectory  # 各フレームに加算すべき補正
-    transforms_smoothed = raw + diff
+    # Each input is already at its observed position. Adding the inter-frame
+    # motion again amplifies shake instead of moving it to the smooth trajectory.
+    corrections = diff
 
     for i, p in enumerate(files):
         if cancel_event is not None and cancel_event.is_set():
@@ -172,7 +186,7 @@ def stabilize_chunk(
         frame = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if frame is None:
             raise RuntimeError(f"failed to read {p}")
-        dx, dy, da = transforms_smoothed[i]
+        dx, dy, da = corrections[i]
         stabilized = _apply_transform_to_frame(
             frame,
             dx,
@@ -181,7 +195,8 @@ def stabilize_chunk(
             crop_border=crop_border,
         )
         out_path = frames_out / p.name
-        cv2.imwrite(str(out_path), stabilized)
+        if not cv2.imwrite(str(out_path), stabilized):
+            raise RuntimeError(f"failed to write {out_path}")
         if on_progress is not None:
             try:
                 on_progress(i + 1, len(files))

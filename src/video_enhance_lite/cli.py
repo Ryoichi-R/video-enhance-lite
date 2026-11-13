@@ -804,6 +804,7 @@ _AUTO_LOW_RISK_KEYS = ("encode", "upscale", "deinterlace")
 def _apply_auto_mode(
     decs: list[StageDecision],
     explicit_enable: set[str] | frozenset[str] = frozenset(),
+    explicit_disable: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[StageDecision], list[str]]:
     """Returns (decisions, deferred_keys).
 
@@ -813,11 +814,18 @@ def _apply_auto_mode(
     `explicit_enable` (`--enable` のキー集合) は「明示同意済み」として enabled=True にし、
     deferred に積まない (P1-2)。これが無いと「--enable で個別採用してください」という
     エラー案内に従っても同じステージが保留され続け、抜けられない。
+
+    `explicit_disable` (`--disable` / `--no-realesrgan` / `--no-rife`) のステージは
+    明示的に不採用と決まっているため保留扱いにしない。`_apply_forced_overrides` と同じく
+    disable を enable より優先する。
     """
     deferred: list[str] = []
     for d in decs:
         if d.key == "encode":
             d.enabled = True
+            continue
+        if d.key in explicit_disable:
+            d.enabled = False
             continue
         if d.key in explicit_enable:
             d.enabled = True
@@ -1168,7 +1176,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # 8) mode dispatch
     if args.auto:
-        decs, deferred = _apply_auto_mode(decs, explicit_enable=set(args.enable))
+        explicit_disable = set(args.disable)
+        if args.no_realesrgan:
+            explicit_disable.add("upscale")
+        if args.no_rife:
+            explicit_disable.add("interpolate")
+        decs, deferred = _apply_auto_mode(
+            decs, explicit_enable=set(args.enable), explicit_disable=explicit_disable
+        )
         if deferred:
             print(
                 "[--auto] 以下のステージは画質変化を伴うため保留しました。明示同意が必要です:",
@@ -1408,7 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
     # P2-2: 並列実行時のエラー伝播 / Ctrl+C 中断のため CLI でも cancel_event を配線する
     cancel_event = threading.Event()
     try:
-        pipeline.run_pipeline(
+        saved_path = pipeline.run_pipeline(
             input_path=args.input,
             output_path=output_path,
             decisions=decs,
@@ -1473,7 +1488,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] {e}", file=sys.stderr)
         return _finish(2, failed=True)
 
-    print(f"[OK] saved: {output_path}")
+    # run_pipeline picks another name only if output_path appeared meanwhile.
+    print(f"[OK] saved: {saved_path or output_path}")
     return _finish(0)
 
 

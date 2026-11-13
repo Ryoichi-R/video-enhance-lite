@@ -103,7 +103,7 @@ def test_temp_guard_passes_effective_worker_count(app, monkeypatch):
 def test_derive_output_path_for_gui_uses_workspace(monkeypatch, tmp_path):
     # 出力フォルダ未指定時は WORKSPACE_ROOT 直下に置かれ、実行スペックで命名される。
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
-    inp = Path(r"D:\elsewhere\my video.mp4")
+    inp = tmp_path / "elsewhere" / "my video.mp4"
     summary = compute_output_summary(
         _FakeMeta(width=1280, height=720, fps=Fraction(30, 1)),
         _encode_only_decisions(),
@@ -116,7 +116,7 @@ def test_derive_output_path_for_gui_uses_workspace(monkeypatch, tmp_path):
 def test_derive_output_path_for_gui_with_summary_uses_spec(monkeypatch, tmp_path):
     # summary 付き = 実行スペック命名 `_{幅}x{高}-{fps}p`
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
-    inp = Path(r"D:\elsewhere\my video.mp4")
+    inp = tmp_path / "elsewhere" / "my video.mp4"
     summary = compute_output_summary(
         _FakeMeta(width=1920, height=1080, fps=Fraction(60, 1)),
         _encode_only_decisions(),
@@ -129,7 +129,7 @@ def test_derive_output_path_for_gui_uses_selected_folder(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
     selected = tmp_path / "out"
     selected.mkdir()
-    inp = Path(r"D:\elsewhere\my video.mp4")
+    inp = tmp_path / "elsewhere" / "my video.mp4"
     summary = compute_output_summary(
         _FakeMeta(width=1920, height=1080, fps=Fraction(60, 1)),
         _encode_only_decisions(),
@@ -140,7 +140,7 @@ def test_derive_output_path_for_gui_uses_selected_folder(monkeypatch, tmp_path):
 
 def test_derive_output_path_for_gui_avoids_existing_file(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
-    inp = Path(r"D:\elsewhere\my video.mp4")
+    inp = tmp_path / "elsewhere" / "my video.mp4"
     summary = compute_output_summary(
         _FakeMeta(width=1920, height=1080, fps=Fraction(60, 1)),
         _encode_only_decisions(),
@@ -390,7 +390,7 @@ def test_pick_output_accepts_outside_workspace(app, monkeypatch, tmp_path):
 
 def test_finalize_output_path_reflects_dialog_changes(app, tmp_path):
     # 出力フォルダ直下に、ダイアログで確定した実行スペック名で保存される
-    app.var_input.set(str(Path(r"D:\elsewhere\clip.mp4")))
+    app.var_input.set(str(tmp_path / "elsewhere" / "clip.mp4"))
     app._meta = _FakeMeta(width=1920, height=1080, fps=Fraction(30, 1))
     app._decisions = _encode_only_decisions()
     selected = tmp_path / "selected"
@@ -409,17 +409,17 @@ def test_finalize_output_path_reflects_dialog_changes(app, tmp_path):
             params={"scale": 4, "target_width": 3840},
         )
     ]
-    out = app._finalize_output_path(Path(r"D:\elsewhere\clip.mp4"), dec_result)
+    out = app._finalize_output_path(tmp_path / "elsewhere" / "clip.mp4", dec_result)
     assert out == selected / "clip_3840x2160-30p.mp4"
     assert app.var_output.get() == str(selected)
 
 
 def test_finalize_output_path_uses_default_workspace_when_folder_empty(app, tmp_path):
     # 出力フォルダ空欄なら WORKSPACE_ROOT 直下に自動命名する
-    app.var_input.set(str(Path(r"D:\elsewhere\clip.mp4")))
+    app.var_input.set(str(tmp_path / "elsewhere" / "clip.mp4"))
     app._meta = _FakeMeta(width=1920, height=1080, fps=Fraction(30, 1))
     app._decisions = _encode_only_decisions()
-    out = app._finalize_output_path(Path(r"D:\elsewhere\clip.mp4"), _encode_only_decisions())
+    out = app._finalize_output_path(tmp_path / "elsewhere" / "clip.mp4", _encode_only_decisions())
     assert out == tmp_path / "clip_1920x1080-30p.mp4"
     assert app.var_output.get() == ""
 

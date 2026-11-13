@@ -1,1 +1,1 @@
-__version__ = "0.2.0"  # pyproject.toml の [project].version と同期させること
+__version__ = "0.2.3"  # pyproject.toml の [project].version と同期させること

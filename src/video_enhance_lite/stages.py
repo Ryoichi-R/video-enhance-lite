@@ -615,19 +615,31 @@ def build_extract_args(
     vf_chain: str = "",
     normalization_fps: Fraction | None = None,
     expected_frame_count: int | None = None,
+    video_start_offset_sec: float = 0.0,
+    per_stream_timestamp_rebase: bool = False,
 ) -> list[str]:
     """Chunk extract command for the standard chunked pipeline.
 
-    Indexed containers use fast accurate input seeking. MPEG-TS family inputs can
+    `start_sec` is on the video timeline. `video_start_offset_sec` is how much
+    later the video starts than the container (audio may lead).
+
+    Indexed containers use fast accurate input seeking. MPEG-PS/TS inputs can
     seek to a later GOP on current FFmpeg builds and silently lose boundary frames,
     so they retain the correctness-first output-side seek path.
     """
-    transport_stream = input_path.suffix.lower() in {".ts", ".mts", ".m2ts"}
+    transport_stream = per_stream_timestamp_rebase or input_path.suffix.lower() in {
+        ".ts",
+        ".mts",
+        ".m2ts",
+    }
     argv = [str(ffmpeg), "-y"]
     if not transport_stream:
-        argv += ["-ss", f"{start_sec}"]
+        # Input seeking counts from the container start.
+        argv += ["-ss", f"{start_sec + video_start_offset_sec}"]
     argv += ["-i", str(input_path)]
     if transport_stream:
+        # FFmpeg rebases MPEG-PS/TS on the streams in use; this command reads only
+        # video, so the output timeline already starts at the first video frame.
         argv += ["-ss", f"{start_sec}"]
     if normalization_fps is not None:
         normalization_fps = Fraction(normalization_fps)

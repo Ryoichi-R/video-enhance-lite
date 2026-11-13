@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import collections
 import json
 import math
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
@@ -42,10 +45,16 @@ _FRAME_INTERVAL_ABS_TOLERANCE_SEC = 0.001
 _FRAME_INTERVAL_MIN_DELTAS_PER_WINDOW = 4
 _FRAME_INTERVAL_SAMPLE_LIMIT = 32
 _FRAME_INTERVAL_PACKET_LIMIT = 64
+_TRANSPORT_STREAM_SUFFIXES = frozenset({".ts", ".mts", ".m2ts"})
+# FFmpeg rebases these demuxers (AVFMT_TS_DISCONT) on the earliest *used*
+# stream instead of the container start. Measured with FFmpeg 9.0: mpegts and
+# MPEG-PS ("mpeg") do; mov/mp4, matroska/webm, flv, and avi do not.
+_PER_STREAM_REBASE_FORMATS = frozenset({"mpegts", "mpegtsraw", "mpeg"})
 
 
 @dataclass(frozen=True)
 class VideoMetadata:
+    # Dimensions after FFmpeg autorotation; duration_sec is video-only.
     width: int
     height: int
     fps: Fraction
@@ -61,6 +70,14 @@ class VideoMetadata:
     framerate_status: FramerateStatus = "unknown"
     primary_video_index: int = 0
     streams: tuple[MediaStreamInfo, ...] | None = None
+    container_duration_sec: float | None = None
+    # Video start relative to the container start that FFmpeg uses for input
+    # seeking. Audio/subtitles may begin earlier; processing must not drop it.
+    video_start_offset_sec: float = 0.0
+    # Earliest audio/subtitle start relative to the container start, if any.
+    preserved_streams_start_offset_sec: float | None = None
+    # True when FFmpeg rebases timestamps on the streams a command uses.
+    per_stream_timestamp_rebase: bool = False
 
 
 FaceCandidateConfidence = Literal["high", "medium", "low", "unknown"]
@@ -135,17 +152,61 @@ def _read_image_path_safe(path: Path, np: Any, cv2: Any) -> Any | None:
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(  # noqa: S603 - shell=False, list argv
+_CANCEL_POLL_SEC = 0.2
+# ffprobe -show_packets reads the whole file without decoding; allow for a slow
+# (network or USB) source at this throughput before declaring it stuck.
+_PACKET_SCAN_MIN_BYTES_PER_SEC = 10 * 1024 * 1024
+
+
+def _run(
+    argv: list[str],
+    *,
+    timeout: float = config.DEFAULT_ANALYZE_PROCESS_TIMEOUT_SEC,
+    cancel_event: threading.Event | None = None,
+) -> subprocess.CompletedProcess:
+    """Run ffprobe/ffmpeg; stop it on timeout (total wall time) or cancellation.
+
+    A damaged file or an unresponsive network share must not hang the CLI/GUI.
+    Non-zero exit raises CalledProcessError as subprocess.run(check=True) does.
+    """
+    proc = subprocess.Popen(  # noqa: S603 - shell=False, list argv
         argv,
-        check=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
         shell=False,
         creationflags=_HIDE_WINDOW_FLAGS,
     )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=_CANCEL_POLL_SEC)
+                break
+            except subprocess.TimeoutExpired:
+                cancelled = cancel_event is not None and cancel_event.is_set()
+                if not cancelled and time.monotonic() < deadline:
+                    continue
+                proc.kill()
+                proc.communicate()
+                name = Path(str(argv[0])).name
+                if cancelled:
+                    raise AnalyzerError(f"cancelled while running {name}") from None
+                raise AnalyzerError(
+                    f"{name} did not finish within {timeout:.0f}s; the input may be damaged "
+                    "or on a slow or unresponsive drive"
+                ) from None
+    except BaseException:
+        # Ctrl+C or any other interruption: never leave the child running.
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        raise
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, argv, stdout, stderr)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _parse_rate(rate: str | None) -> Fraction | None:
@@ -195,16 +256,33 @@ def _probe_frame_timestamp_windows(
     ffprobe: Path,
     input_path: Path,
     duration_sec: float,
+    cancel_event: threading.Event | None = None,
+    video_start_sec: float = 0.0,
+    nominal_fps: Fraction | None = None,
 ) -> list[list[float]] | None:
-    """Decode three bounded presentation-order frame windows with ffprobe."""
+    """Sample presentation timestamps, retrying failed seeks by decoding from the start.
+
+    ffprobe read_intervals uses absolute stream timestamps. A packet-limited
+    seek can miss every keyframe in a long GOP; never classify an earlier
+    window as evidence for the requested one.
+    """
     window_span = min(2.0, max(0.25, duration_sec / 4.0))
+    # Observe enough frames even at low fps, while retaining the requirement
+    # for four positive deltas. Short inputs use the whole video, not a tiny
+    # quarter-window that makes otherwise usable CFR clips unclassifiable.
+    frame_interval = 1.0 / float(nominal_fps) if nominal_fps and nominal_fps > 0 else 0.0
+    window_span = min(
+        duration_sec, max(window_span, (_FRAME_INTERVAL_MIN_DELTAS_PER_WINDOW + 2) * frame_interval)
+    )
     starts = (
         0.0,
         max(0.0, duration_sec / 2.0 - window_span / 2.0),
         max(0.0, duration_sec - window_span),
     )
     windows: list[list[float]] = []
-    for start in starts:
+    for relative_start in starts:
+        start = video_start_sec + relative_start
+        end = start + window_span
         argv = [
             str(ffprobe),
             "-v",
@@ -220,19 +298,44 @@ def _probe_frame_timestamp_windows(
             "json",
             str(input_path),
         ]
-        try:
-            proc = _run(argv)
+
+        def read_window(command: list[str]) -> list[float]:
+            proc = _run(command, cancel_event=cancel_event)
             payload = json.loads(proc.stdout or "{}")
+            values = []
+            for frame in payload.get("frames") or []:
+                timestamp = _parse_float(frame.get("best_effort_timestamp_time"))
+                if (
+                    timestamp is not None
+                    and math.isfinite(timestamp)
+                    and start - 1e-6 <= timestamp < end
+                ):
+                    values.append(timestamp)
+            return values[:_FRAME_INTERVAL_SAMPLE_LIMIT]
+
+        try:
+            values = read_window(argv)
+            margin = 5.0
+            while len(values) <= _FRAME_INTERVAL_MIN_DELTAS_PER_WINDOW:
+                # Retry from progressively earlier points, decoding through the
+                # requested window rather than stopping after 64 packets. This
+                # avoids a full-file decode for an ordinary GOP in a long video.
+                # At the video start, omit the seek entirely to include its
+                # first keyframe. Timeout/cancellation remain active on retries.
+                coarse = max(video_start_sec, start - margin)
+                seek = f"{coarse:.6f}" if coarse > video_start_sec else ""
+                # Read past the observed region so reordered B frames are
+                # emitted; timestamps outside the observation window stay out
+                # of classification. Reaching EOF flushes the decoder as well.
+                decode_end = end + _FRAME_INTERVAL_SAMPLE_LIMIT * frame_interval
+                argv[argv.index("-read_intervals") + 1] = f"{seek}%{decode_end:.6f}"
+                values = read_window(argv)
+                if not seek:
+                    break
+                margin *= 2
         except (subprocess.CalledProcessError, json.JSONDecodeError, OSError, ValueError):
             return None
-        values: list[float] = []
-        for frame in payload.get("frames") or []:
-            timestamp = _parse_float(frame.get("best_effort_timestamp_time"))
-            if timestamp is not None and math.isfinite(timestamp):
-                values.append(timestamp)
-        # Packet-limited probing can end before delayed B frames are emitted. Ask for
-        # extra packets, then classify only a bounded presentation-order prefix.
-        windows.append(values[:_FRAME_INTERVAL_SAMPLE_LIMIT])
+        windows.append(values)
     return windows
 
 
@@ -242,6 +345,8 @@ def _classify_framerate(
     duration_sec: float,
     r_rate: Fraction,
     avg_rate: Fraction | None,
+    cancel_event: threading.Event | None = None,
+    video_start_sec: float = 0.0,
 ) -> FramerateStatus:
     # avg_frame_rate が欠落・無効な入力は、安定した短時間サンプルだけを根拠に
     # CFR と断定しない。PTS を失う pipeline では安全側の unknown へ倒す。
@@ -254,7 +359,9 @@ def _classify_framerate(
     nominal_rate = avg_rate
     if nominal_rate <= 0:
         return "unknown"
-    windows = _probe_frame_timestamp_windows(ffprobe, input_path, duration_sec)
+    windows = _probe_frame_timestamp_windows(
+        ffprobe, input_path, duration_sec, cancel_event, video_start_sec, nominal_rate
+    )
     if windows is None:
         return "unknown"
 
@@ -283,7 +390,70 @@ def _classify_framerate(
     return "cfr"
 
 
-def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
+def _probe_video_packet_duration(
+    ffprobe: Path,
+    input_path: Path,
+    fps: Fraction,
+    cancel_event: threading.Event | None = None,
+) -> float:
+    """Containers such as Matroska may omit stream.duration.
+
+    Read video packet timestamps (no frame decoding), never substitute the
+    container duration: another stream may continue after the video ends.
+    One short `key=value` line per packet keeps memory use low on long files.
+    """
+    argv = [
+        str(ffprobe),
+        "-v",
+        "error",
+        # Reconstruct omitted PTS from DTS when possible (notably the final
+        # MPEG-PS packet); otherwise its last frame would be excluded.
+        "-fflags",
+        "+genpts",
+        "-select_streams",
+        "v:0",
+        "-show_packets",
+        "-show_entries",
+        "packet=pts_time,duration_time",
+        "-of",
+        "compact=p=0:nk=0",
+        str(input_path),
+    ]
+    try:
+        size = input_path.stat().st_size
+    except OSError:
+        size = 0
+    timeout = max(
+        float(config.DEFAULT_ANALYZE_PROCESS_TIMEOUT_SEC), size / _PACKET_SCAN_MIN_BYTES_PER_SEC
+    )
+    try:
+        output = _run(argv, timeout=timeout, cancel_event=cancel_event).stdout or ""
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise AnalyzerError(f"ffprobe(video duration) failed: {exc}") from exc
+    first_pts = math.inf
+    last_end = -math.inf
+    for line in output.splitlines():
+        packet = dict(item.split("=", 1) for item in line.strip().split("|") if "=" in item)
+        pts = _parse_float(packet.get("pts_time"))
+        if pts is None or not math.isfinite(pts):
+            continue
+        packet_duration = _parse_float(packet.get("duration_time"))
+        if packet_duration is None or not math.isfinite(packet_duration) or packet_duration <= 0:
+            packet_duration = 1.0 / float(fps)
+        first_pts = min(first_pts, pts)
+        last_end = max(last_end, pts + packet_duration)
+    duration = last_end - first_pts
+    if not math.isfinite(duration) or duration <= 0:
+        raise AnalyzerError("invalid duration: no usable video packet timestamps")
+    return duration
+
+
+def probe_metadata(
+    ffprobe: Path,
+    input_path: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> VideoMetadata:
     """Public for tests. Runs ffprobe for video/format and the complete stream inventory."""
     v_argv = [
         str(ffprobe),
@@ -292,14 +462,16 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=index,width,height,r_frame_rate,avg_frame_rate,duration,codec_name,"
-        "bit_rate,pix_fmt,color_range,color_space,field_order:format=duration,bit_rate",
+        "stream=index,width,height,r_frame_rate,avg_frame_rate,duration,start_time,codec_name,"
+        "bit_rate,pix_fmt,color_range,color_space,field_order:"
+        "format=duration,start_time,bit_rate,format_name:"
+        "stream_side_data=rotation:stream_tags=rotate",
         "-of",
         "json",
         str(input_path),
     ]
     try:
-        v_proc = _run(v_argv)
+        v_proc = _run(v_argv, cancel_event=cancel_event)
     except subprocess.CalledProcessError as e:
         raise AnalyzerError(f"ffprobe(video stream) failed: {e.stderr or e}") from e
     try:
@@ -312,21 +484,54 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
         raise AnalyzerError("no video stream found")
     s = streams[0]
     fmt = v_data.get("format") or {}
+    format_names = {name.strip() for name in str(fmt.get("format_name") or "").split(",")}
 
     width = _parse_int(s.get("width")) or 0
     height = _parse_int(s.get("height")) or 0
     if width <= 0 or height <= 0:
         raise AnalyzerError(f"invalid resolution: {width}x{height}")
 
+    rotation = _parse_float((s.get("tags") or {}).get("rotate")) or 0.0
+    for side_data in s.get("side_data_list") or []:
+        if "rotation" in side_data:
+            rotation = _parse_float(side_data["rotation"])
+            break
+    if rotation is None or not math.isfinite(rotation):
+        raise AnalyzerError("invalid video rotation")
+    if any(math.isclose(rotation % 360, angle, abs_tol=0.001) for angle in (90, 270)):
+        width, height = height, width
+
     r_rate = _parse_rate(s.get("r_frame_rate"))
-    if r_rate is None:
+    if r_rate is None or r_rate <= 0:
         raise AnalyzerError(f"could not parse r_frame_rate: {s.get('r_frame_rate')!r}")
 
     stream_duration = _parse_float(s.get("duration"))
     format_duration = _parse_float(fmt.get("duration"))
-    duration = format_duration if format_duration is not None else stream_duration
-    if duration is None or not math.isfinite(duration) or duration <= 0:
-        raise AnalyzerError(f"invalid duration: {fmt.get('duration')!r}/{s.get('duration')!r}")
+    # MPEG-PS stream.duration can omit the final frame duration. Packet ends
+    # are authoritative here, as for containers without a stream duration.
+    if (
+        "mpeg" not in format_names
+        and stream_duration is not None
+        and math.isfinite(stream_duration)
+        and stream_duration > 0
+    ):
+        duration = stream_duration
+    else:
+        duration = _probe_video_packet_duration(ffprobe, input_path, r_rate, cancel_event)
+    video_start = _parse_float(s.get("start_time"))
+    container_start = _parse_float(fmt.get("start_time"))
+    video_start_offset = 0.0
+    if (
+        video_start is not None
+        and container_start is not None
+        and math.isfinite(video_start)
+        and math.isfinite(container_start)
+    ):
+        # FFmpeg input seeking is relative to the container start (the earliest
+        # stream). A later video start must be added to every video seek.
+        video_start_offset = max(0.0, video_start - container_start)
+    if format_duration is None or not math.isfinite(format_duration) or format_duration <= 0:
+        format_duration = video_start_offset + duration
 
     codec = str(s.get("codec_name") or "unknown")
     bitrate = _parse_int(s.get("bit_rate"))
@@ -349,13 +554,13 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
         "-v",
         "error",
         "-show_entries",
-        "stream=index,codec_type,codec_name:stream_tags=language:stream_disposition",
+        "stream=index,codec_type,codec_name,start_time:stream_tags=language:stream_disposition",
         "-of",
         "json",
         str(input_path),
     ]
     try:
-        inventory_proc = _run(inventory_argv)
+        inventory_proc = _run(inventory_argv, cancel_event=cancel_event)
     except subprocess.CalledProcessError as e:
         raise AnalyzerError(f"ffprobe(stream inventory) failed: {e.stderr or e}") from e
     try:
@@ -389,6 +594,17 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
             )
         )
     has_audio = any(stream.codec_type == "audio" for stream in inventory)
+    preserved_starts = [
+        start - container_start
+        for raw_stream in inventory_data.get("streams") or []
+        if str(raw_stream.get("codec_type") or "").strip().lower() in {"audio", "subtitle"}
+        for start in [_parse_float(raw_stream.get("start_time"))]
+        if start is not None
+        and container_start is not None
+        and math.isfinite(start)
+        and math.isfinite(container_start)
+    ]
+    preserved_streams_start_offset = max(0.0, min(preserved_starts)) if preserved_starts else None
 
     framerate_status = _classify_framerate(
         ffprobe,
@@ -396,6 +612,10 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
         float(duration),
         r_rate,
         avg_rate,
+        cancel_event=cancel_event,
+        video_start_sec=video_start
+        if video_start is not None and math.isfinite(video_start)
+        else 0.0,
     )
 
     return VideoMetadata(
@@ -414,7 +634,183 @@ def probe_metadata(ffprobe: Path, input_path: Path) -> VideoMetadata:
         framerate_status=framerate_status,
         primary_video_index=primary_video_index,
         streams=tuple(inventory),
+        container_duration_sec=float(format_duration),
+        video_start_offset_sec=float(video_start_offset),
+        preserved_streams_start_offset_sec=preserved_streams_start_offset,
+        per_stream_timestamp_rebase=bool(format_names & _PER_STREAM_REBASE_FORMATS),
     )
+
+
+def _run_with_frame_progress(
+    argv: list[str],
+    *,
+    cancel_event: threading.Event | None = None,
+    idle_timeout_sec: float | None = None,
+    on_progress: Callable[[], None] | None = None,
+) -> None:
+    """Run a decode pass with an advancing-frame idle limit, not a wall-time limit.
+
+    The first output must process every video frame and FFmpeg must emit
+    ``-progress pipe:1``. Repeated counters/log chatter do not extend the limit.
+    Reader threads drain both pipes on Windows as well as POSIX; diagnostic
+    storage is bounded and cancellation always kills and reaps the child.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise AnalyzerError("cancelled during sampling")
+    timeout = (
+        float(config.DEFAULT_ANALYZE_PROCESS_TIMEOUT_SEC)
+        if idle_timeout_sec is None
+        else idle_timeout_sec
+    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            shell=False,
+            creationflags=_HIDE_WINDOW_FLAGS,
+        )
+    except OSError as exc:
+        raise AnalyzerError(f"could not start sample extraction: {exc}") from exc
+    lock = threading.Lock()
+    last_frame = -1
+    last_advance = time.monotonic()
+    errors: collections.deque[str] = collections.deque(maxlen=64)
+
+    def read_progress() -> None:
+        nonlocal last_frame, last_advance
+        for line in proc.stdout:
+            key, separator, value = line.strip().partition("=")
+            if separator and key == "frame":
+                frame = _parse_int(value)
+                with lock:
+                    if frame is not None and frame > last_frame:
+                        last_frame = frame
+                        last_advance = time.monotonic()
+
+    def read_errors() -> None:
+        for line in proc.stderr:
+            errors.append(line[-4096:])
+
+    readers = [
+        threading.Thread(target=target, daemon=True) for target in (read_progress, read_errors)
+    ]
+    try:
+        for reader in readers:
+            reader.start()
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise AnalyzerError("cancelled during sampling")
+            try:
+                proc.wait(timeout=_CANCEL_POLL_SEC)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if on_progress is not None:
+                on_progress()
+            with lock:
+                idle = time.monotonic() - last_advance
+            if idle >= timeout:
+                raise AnalyzerError(f"sample extraction made no decoding progress for {timeout:g}s")
+        for reader in readers:
+            reader.join()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, argv, stderr="".join(errors))
+        if on_progress is not None:
+            on_progress()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        for reader in readers:
+            if reader.ident is not None:
+                reader.join()
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def _extract_samples_one_pass(
+    ffmpeg: Path,
+    input_path: Path,
+    duration_sec: float,
+    paths: list[Path],
+    cancel_event: threading.Event | None,
+    progress: Callable[[int, int], None] | None,
+) -> None:
+    # Share one decode across sample branches. Each branch emits a seed at
+    # frame zero to initialize its encoder immediately, then its actual sample.
+    # Without seeds, FFmpeg may defer progress until every distant sample has
+    # initialized its output. Independent branches also preserve duplicates
+    # when multiple sample times land in the same frame interval.
+    count = len(paths)
+    graph = (
+        f"[0:v:0]setpts=PTS-STARTPTS,split={count + 1}[scan]"
+        + "".join(f"[s{i}]" for i in range(count))
+        + ";"
+        + ";".join(
+            f"[s{i}]select='eq(n,0)+gte(t,{duration_sec * (i + 0.5) / count:.6f})',"
+            f"trim=end_frame=2,setpts=PTS-STARTPTS[o{i}]"
+            for i in range(count)
+        )
+    )
+    argv = [
+        str(ffmpeg),
+        "-y",
+        "-nostdin",
+        "-v",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-stats_period",
+        "0.5",
+        "-i",
+        str(input_path),
+        "-filter_complex",
+        graph,
+        # The first output counts every decoded frame, including the stretches
+        # between samples. The null muxer writes no media data.
+        "-map",
+        "[scan]",
+        "-f",
+        "null",
+        "-",
+    ]
+    with tempfile.TemporaryDirectory(prefix=".sampling-", dir=paths[0].parent) as scratch:
+        selected = []
+        for i, path in enumerate(paths):
+            prefix = Path(scratch) / f"sample_{i:04d}"
+            selected.append(Path(f"{prefix}_1.png"))
+            argv += [
+                "-map",
+                f"[o{i}]",
+                "-frames:v",
+                "2",
+                "-fps_mode",
+                "passthrough",
+                "-threads:v",
+                "1",
+                "-start_number",
+                "0",
+                f"{prefix}_%d.png",
+            ]
+        reported = 0
+
+        def report_completed() -> None:
+            nonlocal reported
+            completed = sum(path.is_file() for path in selected)
+            if progress is not None and completed > reported:
+                reported = completed
+                progress(completed, count)
+
+        _run_with_frame_progress(argv, cancel_event=cancel_event, on_progress=report_completed)
+        for source, destination in zip(selected, paths):
+            if source.is_file():
+                source.replace(destination)
 
 
 def _extract_samples(
@@ -426,36 +822,51 @@ def _extract_samples(
     cancel_event: threading.Event | None,
     progress: Callable[[int, int], None] | None,
     warning: Callable[[str], None] | None = None,
+    start_offset_sec: float = 0.0,
+    per_stream_timestamp_rebase: bool = False,
 ) -> list[Path]:
     if sample_count < 2:
         raise ValueError(f"sample_count must be >= 2, got {sample_count}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    decode_seek = (
+        per_stream_timestamp_rebase or input_path.suffix.lower() in _TRANSPORT_STREAM_SUFFIXES
+    )
+    paths = [out_dir / f"sample_{i:04d}.png" for i in range(sample_count)]
+    if decode_seek:
+        try:
+            _extract_samples_one_pass(
+                ffmpeg, input_path, duration_sec, paths, cancel_event, progress
+            )
+        except subprocess.CalledProcessError as exc:
+            raise AnalyzerError(f"ffmpeg sample extract failed: {exc.stderr or exc}") from exc
     samples: list[Path] = []
     for i in range(sample_count):
         if cancel_event is not None and cancel_event.is_set():
             raise AnalyzerError("cancelled during sampling")
         # 等間隔で sample_count 枚: t_i = duration * (i + 0.5) / sample_count
         t = duration_sec * (i + 0.5) / sample_count
-        out_path = out_dir / f"sample_{i:04d}.png"
-        argv = [
-            str(ffmpeg),
-            "-y",
-            "-ss",
-            f"{t:.6f}",
-            "-i",
-            str(input_path),
-            "-frames:v",
-            "1",
-            "-f",
-            "image2",
-            str(out_path),
-        ]
-        try:
-            _run(argv)
-        except subprocess.CalledProcessError as e:
-            raise AnalyzerError(
-                f"ffmpeg sample extract failed at t={t:.3f}: {e.stderr or e}"
-            ) from e
+        out_path = paths[i]
+        if not decode_seek:
+            target = start_offset_sec + t
+            argv = [
+                str(ffmpeg),
+                "-y",
+                "-ss",
+                f"{target:.6f}",
+                "-i",
+                str(input_path),
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                str(out_path),
+            ]
+            try:
+                _run(argv, cancel_event=cancel_event)
+            except subprocess.CalledProcessError as exc:
+                raise AnalyzerError(
+                    f"ffmpeg sample extract failed at t={t:.3f}: {exc.stderr or exc}"
+                ) from exc
         if not out_path.exists() and i == sample_count - 1 and samples:
             if warning is not None:
                 warning(
@@ -468,7 +879,7 @@ def _extract_samples(
         if not out_path.exists():
             raise AnalyzerError(f"ffmpeg sample extract produced no file at t={t:.3f}")
         samples.append(out_path)
-        if progress is not None:
+        if progress is not None and not decode_seek:
             progress(i + 1, sample_count)
     return samples
 
@@ -746,14 +1157,19 @@ def analyze(
     """
     np, cv2 = _require_numpy_cv2()
 
-    meta = probe_metadata(ffprobe, input_path)
+    meta = probe_metadata(ffprobe, input_path, cancel_event=cancel_event)
     if cancel_event is not None and cancel_event.is_set():
         raise AnalyzerError("cancelled after probe")
 
     sd = sample_dir if sample_dir is not None else (config.derive_temp_dir(input_path) / "analyze")
     sd.mkdir(parents=True, exist_ok=True)
     try:
-        effective_sample_count = max(2, int(sample_count))
+        # Do not request more timestamps than the nominal number of frames.
+        # On a low-fps/short clip, several targets could otherwise fall after
+        # the last frame and turn a usable video into a missing-middle-sample
+        # error. Retain the minimum of two and the final-sample warning policy.
+        nominal_frames = max(2, int(meta.duration_sec * float(meta.avg_fps or meta.fps) + 1e-6))
+        effective_sample_count = min(max(2, int(sample_count)), nominal_frames)
         sample_paths = _extract_samples(
             ffmpeg=ffmpeg,
             input_path=input_path,
@@ -763,6 +1179,8 @@ def analyze(
             cancel_event=cancel_event,
             progress=progress,
             warning=warning,
+            start_offset_sec=meta.video_start_offset_sec,
+            per_stream_timestamp_rebase=meta.per_stream_timestamp_rebase,
         )
         frames: list[Any] = []
         timestamped_frames: list[tuple[float, Any]] = []

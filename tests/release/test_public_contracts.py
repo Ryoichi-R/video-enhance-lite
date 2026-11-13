@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from video_enhance_lite import cli, config, deps, stages
+from video_enhance_lite import __version__, cli, config, deps, stages
 from video_enhance_lite.deps import MissingDependencyError
 
 
@@ -91,7 +91,7 @@ def test_package_metadata_and_public_documents_are_coherent():
     metadata = pyproject["project"]
 
     assert metadata["name"] == "video-enhance-lite"
-    assert metadata["version"] == "0.2.0"
+    assert metadata["version"] == __version__ == "0.2.3"
     assert metadata["readme"] == "README.md"
     assert metadata["requires-python"] == ">=3.11,<3.14"
     assert "enhance" in metadata["optional-dependencies"]
