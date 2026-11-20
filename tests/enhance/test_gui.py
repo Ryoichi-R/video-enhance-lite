@@ -220,8 +220,12 @@ def test_window_close_during_worker_waits_for_cancelled_finish(app, monkeypatch)
     assert destroyed == []
     assert app.var_status.get() == "終了待機中…"
 
+    callbacks = []
+    monkeypatch.setattr(app.root, "after", lambda ms, cb: callbacks.append(cb))
     app._handle_finish(gui._FinishEvent("cancelled"))
-
+    assert destroyed == []
+    app._worker_thread = None
+    callbacks.pop()()
     assert destroyed == [True]
 
 
@@ -261,7 +265,7 @@ def test_run_passes_io_idle_timeout_without_changing_worker_settings(app, monkey
     app.var_chunk.set("17")
     app.var_worker_count.set("2")
     app.var_gpu_concurrency.set("1")
-    app._meta = FakeMeta(duration_sec=10.0)
+    app._meta = FakeMeta(duration_sec=34.0)
     decs = _encode_only_decisions()
     app._decisions = decs
     monkeypatch.setattr(app, "_open_decision_dialog", lambda: decs)
@@ -1036,3 +1040,68 @@ def test_handle_finish_no_chain_when_not_pending(app, monkeypatch):
     app._pending_run_after_analyze = False  # 通常の「事前分析」ボタン経路
     app._handle_finish(gui._FinishEvent("success"))
     assert proceed_called["count"] == 0
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_close_waits_for_analysis_cleanup(app, monkeypatch, tmp_path, failure):
+    from types import SimpleNamespace
+
+    entered, release = threading.Event(), threading.Event()
+    closed = []
+    monkeypatch.setattr(app.root, "destroy", lambda: closed.append(True))
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **kw: True)
+    run = SimpleNamespace(run_leaf=tmp_path / "owned")
+    monkeypatch.setattr(gui.temp_workspace, "create_temp_run_context", lambda _: run)
+    rb = deps.ResolvedBinary(Path("ffmpeg"), None, None)
+    monkeypatch.setattr(deps, "check_ffmpeg", lambda: rb)
+    monkeypatch.setattr(deps, "check_ffprobe", lambda: rb)
+    monkeypatch.setattr(analyzer, "analyze", lambda **_: (FakeMeta(), None))
+    monkeypatch.setattr(decisions_mod, "recommend", lambda *args: _encode_only_decisions())
+
+    def cleanup(ctx):
+        assert ctx is run
+        entered.set()
+        assert release.wait(5)
+        if failure:
+            raise gui.temp_workspace.TempWorkspaceError("simulated cleanup failure")
+
+    monkeypatch.setattr(gui.temp_workspace, "cleanup_temp_run", cleanup)
+    app._start_analyze_worker(tmp_path / "in.mp4", {})
+    try:
+        assert entered.wait(5)
+        app._on_close()
+        assert not closed
+        assert not any(isinstance(e, gui._FinishEvent) for e in app._eventq.drain())
+    finally:
+        release.set()
+    app._worker_thread.join(5)
+    events = [e for e in app._eventq.drain() if isinstance(e, gui._FinishEvent)]
+    assert len(events) == 1 and events[0].status == ("failed" if failure else "success")
+    app._handle_finish(events[0])
+    assert closed == [True]
+
+
+def test_hdr_selection_invalidates_cached_analysis(app):
+    assert not app.var_hdr_to_sdr.get()
+    app._meta = FakeMeta()
+    app._decisions = _encode_only_decisions()
+    generation = app._analysis_generation
+    app.var_hdr_to_sdr.set(True)
+    assert app._meta is None and app._decisions is None
+    assert app._analysis_generation > generation
+
+
+def test_cancel_after_analysis_prevents_queued_run(app):
+    app._current_worker_kind = "analyze"
+    app._pending_run_after_analyze = True
+    app._cancel_event = threading.Event()
+    app._on_cancel()
+    app._handle_finish(
+        gui._FinishEvent(
+            "success",
+            generation=app._analysis_generation,
+            meta=FakeMeta(),
+            decisions=_encode_only_decisions(),
+        )
+    )
+    assert app._meta is None and not app._pending_run_after_analyze

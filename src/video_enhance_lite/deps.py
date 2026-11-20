@@ -227,14 +227,6 @@ def _has_vidstab_filters(filters_text: str | None) -> bool:
     return has_detect and has_transform
 
 
-def _build_resolved(path: Path) -> ResolvedBinary:
-    return ResolvedBinary(
-        path=path,
-        version=_get_version(path),
-        sha256=config.compute_sha256(path, max_bytes=_VERSION_HASH_MAX_BYTES),
-    )
-
-
 def _resolve_safely(path: Path) -> Path:
     """Best-effort resolve. Falls back to the original path on OSError."""
     try:
@@ -408,9 +400,9 @@ def _validate_resolved(
     if resolved != path:
         _check_binary_shape(name, resolved)
     _check_allowed_root(name, resolved, policy)
-    rb = _build_resolved(resolved)
-    _check_expected_hash(name, rb.sha256, policy)
-    return rb
+    digest = config.compute_sha256(resolved, max_bytes=_VERSION_HASH_MAX_BYTES)
+    _check_expected_hash(name, digest, policy)
+    return ResolvedBinary(path=resolved, version=_get_version(resolved), sha256=digest)
 
 
 def _load_json_config(path: Path) -> dict:

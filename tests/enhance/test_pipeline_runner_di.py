@@ -30,7 +30,6 @@ from tests.support.process_runner import FakeProcessRunner
 _FFMPEG = Path(r"C:\bin\ffmpeg.exe")
 _FFPROBE = Path(r"C:\bin\ffprobe.exe")
 _REALESRGAN = Path(r"C:\bin\realesrgan-ncnn-vulkan.exe")
-_RIFE = Path(r"C:\bin\rife-ncnn-vulkan.exe")
 
 
 class RecordingRunner(FakeProcessRunner):
@@ -112,7 +111,7 @@ def test_injected_runner_used_across_all_stages_and_concat(workspace):
         ffmpeg=_FFMPEG,
         ffprobe=_FFPROBE,
         realesrgan=_REALESRGAN,
-        rife=_RIFE,
+        rife=workspace / "rife-ncnn-vulkan.exe",
         stabilize_backend="vidstab",
         debug_split_postfilter=True,
     )

@@ -123,7 +123,7 @@ def test_run_pipeline_stabilize_opencv_skips_single_frame_chunk(workspace, monke
         input_path=workspace / "in.mp4",
         output_path=workspace / "out.mp4",
         decisions=_make_decisions(stabilize=True),
-        meta=FakeMeta(duration_sec=10.0),
+        meta=FakeMeta(duration_sec=1 / 30),
         chunk_seconds=10,
         log=logs.append,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
@@ -141,7 +141,7 @@ def test_run_pipeline_stabilize_vidstab_skips_single_frame_chunk(workspace):
         input_path=workspace / "in.mp4",
         output_path=workspace / "out.mp4",
         decisions=_make_decisions(stabilize=True),
-        meta=FakeMeta(duration_sec=10.0),
+        meta=FakeMeta(duration_sec=1 / 30),
         chunk_seconds=10,
         log=lambda _: None,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
@@ -164,12 +164,12 @@ def test_run_pipeline_interpolate_skips_single_frame_chunk(workspace):
         input_path=workspace / "in.mp4",
         output_path=workspace / "out.mp4",
         decisions=_make_decisions(interpolate=True),
-        meta=FakeMeta(duration_sec=10.0),
+        meta=FakeMeta(duration_sec=1 / 30),
         chunk_seconds=10,
         log=logs.append,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
     assert any("interpolate skipped" in m for m in logs)
     for c in runner.calls:
@@ -189,7 +189,7 @@ def test_run_pipeline_interpolate_runs_for_multi_frame_chunk(workspace):
         log=lambda _: None,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
     rife_calls = [c for c in runner.calls if "rife" in Path(c[0]).name.lower()]
     assert len(rife_calls) == 1

@@ -22,6 +22,7 @@ from . import (
     temp_workspace,
 )
 from .decisions import StageDecision, decisions_by_key
+from .framerate import frame_ranges
 from .deps import MissingDependencyError
 from .runtime_estimator import estimate_peak_for_decisions, format_eta_hms
 
@@ -230,7 +231,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="output file path or existing output directory "
-        "(default: <stem>_<WxH>-<fps>p<ext> next to input, "
+        "(default: <stem>_<WxH>-<fps>p.mp4 next to input, "
         "auto-named from the resulting spec, e.g. clip_3840x2160-60p.mp4)",
     )
     p.add_argument(
@@ -258,6 +259,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="accept all recommended stages (explicit consent for quality changes)",
     )
 
+    p.add_argument("--hdr-to-sdr", action="store_true", help="tone-map PQ/HLG HDR to BT.709 SDR")
     p.add_argument(
         "--analyze-only",
         action="store_true",
@@ -998,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
             ffprobe=ffprobe_rb.path,
             ffmpeg=ffmpeg_rb.path,
             sample_count=config.DEFAULT_SAMPLE_COUNT,
+            **({"hdr_to_sdr": True} if args.hdr_to_sdr else {}),
             sample_dir=temp_run.run_leaf / "analyze",
             keep_samples=bool(args.keep_temp or args.keep_temp_on_failure),
             warning=lambda message: print(f"[WARN] {message}", file=sys.stderr),
@@ -1016,6 +1019,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[WARN] {e} analyze-onlyのため診断表示は継続します", file=sys.stderr)
         else:
             print(f"[ERROR] {e}", file=sys.stderr)
+            return _finish(2, failed=True)
+
+    if hdr := pipeline.color.hdr_name(meta):
+        print(f"[color] {hdr} HDR" + (" → BT.709 SDR" if args.hdr_to_sdr else ""), file=sys.stderr)
+        if not args.analyze_only and not args.hdr_to_sdr:
+            print("[ERROR] HDR input requires --hdr-to-sdr", file=sys.stderr)
             return _finish(2, failed=True)
 
     # 5) 入力上限ガード
@@ -1116,6 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
         face_restore_soften=args.face_restore_soften,
         face_restore_global_smooth=args.face_restore_global_smooth,
     )
+    decisions_mod.finalize_interpolation(decs, meta.fps)
     for w in warns:
         print(f"[WARN] {w}", file=sys.stderr)
     if auto_scale_before_override is not None and auto_scale_before_override != args.scale:
@@ -1132,12 +1142,12 @@ def main(argv: list[str] | None = None) -> int:
         png_ratio = pipeline.estimate_compression_ratio(stats)
 
     # PR3 (修正): --worker-count auto = min(cpu_count()//2, len(chunks), 4)
-    estimated_chunks = max(1, math.ceil(float(meta.duration_sec) / float(args.chunk_seconds)))
+    estimated_chunks = len(frame_ranges(meta, args.chunk_seconds))
     if args.worker_count is None:
         cpu = max(1, (os.cpu_count() or 1) // 2)
         effective_worker_count = min(cpu, estimated_chunks, 4)
     else:
-        effective_worker_count = int(args.worker_count)
+        effective_worker_count = min(estimated_chunks, int(args.worker_count))
 
     # 9) analyze-only: print table + 見積もり and exit (ガードは掛けない -- 表示専用)
     if args.analyze_only:
@@ -1211,6 +1221,7 @@ def main(argv: list[str] | None = None) -> int:
         no_realesrgan=args.no_realesrgan,
         no_rife=args.no_rife,
     )
+    decisions_mod.finalize_interpolation(decs, meta.fps)
     by_after_forced = decisions_by_key(decs)
     if by_after_forced.get("face_restore") is not None and by_after_forced["face_restore"].enabled:
         if args.face_restore_start is None and args.face_restore_end is None:
@@ -1223,7 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
     # 8a-2) 出力名を「実行スペック」から確定する。
     #   --output が既存フォルダなら、その直下に実行スペック名で保存する。
     #   decisions がここで最終確定し out_width/out_height/out_fps が定まるため、既定出力名を
-    #   `<stem>_<WxH>-<fps>p<ext>` に置き換える (旧 `_enhanced` 固定を廃止)。
+    #   `<stem>_<WxH>-<fps>p.mp4` に置き換える (旧 `_enhanced` 固定を廃止)。
     if args.output is None or config.is_output_directory(args.output):
         summary = decisions_mod.compute_output_summary(meta, decs)
         spec_suffix = decisions_mod.format_output_spec_suffix(summary)
@@ -1437,6 +1448,8 @@ def main(argv: list[str] | None = None) -> int:
             ffprobe=ffprobe_rb.path,
             realesrgan=realesrgan_path,
             rife=rife_path,
+            rife_model_parent=rife_models_dir if rife_path else None,
+            hdr_to_sdr=args.hdr_to_sdr,
             codeformer=codeformer_local,
             io_idle_timeout_sec=args.io_idle_timeout_sec,
             face_restore_options=pipeline.FaceRestoreOptions(

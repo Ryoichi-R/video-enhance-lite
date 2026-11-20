@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -28,6 +28,7 @@ from .decisions import (
     decisions_by_key,
     format_output_spec_suffix,
 )
+from .framerate import frame_ranges
 from .deps import MissingDependencyError
 from .runtime_estimator import format_eta_hms
 
@@ -63,6 +64,11 @@ _FPS_PRESET_LABELS: dict[str, float | None] = {
 class _FinishEvent:
     status: Literal["success", "failed", "cancelled"]
     message: str | None = None
+    generation: int | None = None
+    meta: analyzer.VideoMetadata | None = None
+    decisions: list[StageDecision] | None = None
+    temp_run: temp_workspace.TempRunContext | None = None
+    keep_temp: bool = False
 
 
 def _parse_chunk_seconds(raw: str) -> int:
@@ -198,8 +204,8 @@ def derive_output_path_for_gui(
     `output_dir` 未指定時はユーザーの Videos 配下へ保存する。
     """
     suffix = format_output_spec_suffix(summary)
-    name = f"{input_path.stem}{suffix}{input_path.suffix}"
-    return config.make_unique_output_path((output_dir or config.get_default_output_root()) / name)
+    directory = output_dir or config.get_default_output_root()
+    return config.make_unique_output_path(directory / config.mp4_output_name(input_path, suffix))
 
 
 def _validate_output_dir_for_gui(path: Path) -> Path:
@@ -743,6 +749,8 @@ class EnhanceDecisionDialog:
                     params=params,
                 )
             )
+        if self.meta is not None:
+            decisions_mod.finalize_interpolation(snap, self.meta.fps)
         return snap
 
     def _refresh_summary(self, *_args) -> None:
@@ -1012,6 +1020,7 @@ class App:
         # (分析中に入力が変わった場合の競合対策)。
         self._analysis_generation = 0
         # "analyze" / "run" — what the currently running worker is doing
+        self._keep_analysis_temp = False
         self._current_worker_kind: str | None = None
         # When True, a successful analyze worker should immediately proceed to dialog + run
         self._pending_run_after_analyze: bool = False
@@ -1034,6 +1043,7 @@ class App:
         self.var_gpu_concurrency = tk.StringVar(value="1")
         # subprocess の総実行時間ではなく、最後の stdout/stderr からの無出力時間。
         self.var_io_idle_timeout_sec = tk.StringVar(value=str(pipeline.DEFAULT_IO_IDLE_TIMEOUT_SEC))
+        self.var_hdr_to_sdr = tk.BooleanVar(value=False)
         self.var_keep_temp = tk.BooleanVar(value=False)
         self.var_status = tk.StringVar(value="待機中")
         self.var_progress_label = tk.StringVar(value="")
@@ -1056,6 +1066,7 @@ class App:
         self.var_output.trace_add("write", self._on_output_changed)
         # P1-4: 入力ファイル変更で古い分析結果のまま実行されるのを防ぐ
         self.var_input.trace_add("write", self._invalidate_analysis)
+        self.var_hdr_to_sdr.trace_add("write", self._invalidate_analysis)
         try:
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         except (AttributeError, tk.TclError):
@@ -1126,6 +1137,9 @@ class App:
         )
         cmb_res.bind("<<ComboboxSelected>>", lambda _e: self._on_preset_changed())
         cmb_fps.bind("<<ComboboxSelected>>", lambda _e: self._on_preset_changed())
+        ttk.Checkbutton(
+            frm_opt, text="HDRをSDR（BT.709）に変換", variable=self.var_hdr_to_sdr
+        ).grid(row=3, column=0, columnspan=4, sticky="w")
         ttk.Checkbutton(frm_opt, text="中間ファイルを残す", variable=self.var_keep_temp).grid(
             row=1, column=0, columnspan=2, sticky="w", padx=6, pady=4
         )
@@ -1387,6 +1401,11 @@ class App:
             )
             return
         normalized, warn = decisions_mod.normalize_target_fps(src_fps, req)
+        if normalized == src_fps:
+            self.var_fps_preview.set(
+                f"補間しません（整数倍に丸めると ×1、{float(src_fps):.3f} fps）"
+            )
+            return
         msg = (
             f"-> {float(normalized):.3f} fps "
             f"(×{int(normalized / src_fps)}, source {float(src_fps):.3f})"
@@ -1435,7 +1454,9 @@ class App:
 
     def _on_analyze(self) -> None:
         """「事前分析」ボタンハンドラ。pending_run_after_analyze は False のまま。"""
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if self._current_worker_kind is not None or (
+            self._worker_thread and self._worker_thread.is_alive()
+        ):
             messagebox.showwarning("実行中", "既に処理が実行中です。")
             return
         validated = self._validate_common()
@@ -1462,12 +1483,15 @@ class App:
         self._cancel_event = threading.Event()
         cancel_event = self._cancel_event
         self._current_worker_kind = "analyze"
+        keep_temp = self.var_keep_temp.get()
+        chain_to_run = self._pending_run_after_analyze
+        hdr_to_sdr = self.var_hdr_to_sdr.get()
         gen = self._analysis_generation
 
         def _worker() -> None:
+            temp_run = None
             try:
                 temp_run = temp_workspace.create_temp_run_context(input_path)
-                self._temp_run = temp_run
                 ffprobe_rb = deps.check_ffprobe()
                 ffmpeg_rb = deps.check_ffmpeg()
                 self._eventq.write(deps.format_resolved_binary("ffprobe", ffprobe_rb))
@@ -1479,19 +1503,11 @@ class App:
                     sample_count=config.DEFAULT_SAMPLE_COUNT,
                     sample_dir=temp_run.run_leaf / "analyze",
                     keep_samples=True,
+                    **({"hdr_to_sdr": True} if hdr_to_sdr else {}),
                     cancel_event=cancel_event,
                     warning=lambda message: self._eventq.write(f"[WARN] {message}"),
                 )
                 decs = decisions_mod.recommend(meta, stats, defaults)
-                if gen != self._analysis_generation:
-                    # 分析中に入力/プリセットが変更された -> 古い入力の結果を採用しない (P1-4)
-                    self._eventq.write(
-                        "[info] 入力/プリセットが変更されたため、この分析結果を破棄しました"
-                    )
-                    self._eventq.finish(_FinishEvent("cancelled"))
-                    return
-                self._meta = meta
-                self._decisions = decs
                 self._eventq.write(
                     f"[analyze] {meta.width}x{meta.height} @ {float(meta.fps):.3f}fps "
                     f"duration={meta.duration_sec:.1f}s audio={meta.has_audio}"
@@ -1499,13 +1515,18 @@ class App:
                 framerate_warning = _format_framerate_warning(meta)
                 if framerate_warning:
                     self._eventq.write(f"[WARN] {framerate_warning}")
-                self._eventq.finish(_FinishEvent("success"))
-            except (analyzer.AnalyzerError, MissingDependencyError) as e:
-                self._eventq.write(f"[ERROR] {e}")
-                self._eventq.finish(_FinishEvent("failed", message=str(e)))
-            except Exception as e:  # noqa: BLE001
-                self._eventq.write(f"[ERROR] {type(e).__name__}: {e}")
-                self._eventq.finish(_FinishEvent("failed", message=str(e)))
+                event = _FinishEvent("success", generation=gen, meta=meta, decisions=decs)
+            except Exception as exc:
+                self._eventq.write(f"[ERROR] {exc}")
+                event = _FinishEvent("cancelled" if cancel_event.is_set() else "failed", str(exc))
+            if temp_run is not None:
+                if chain_to_run and event.status == "success" and not cancel_event.is_set():
+                    event = replace(event, temp_run=temp_run, keep_temp=keep_temp)
+                elif not keep_temp:
+                    event = self._finish_cleanup(temp_run, event)
+                else:
+                    self._eventq.write(f"[keep-temp] {temp_run.run_leaf}")
+            self._eventq.finish(event)
 
         self._worker_thread = threading.Thread(target=_worker, daemon=True)
         self._worker_thread.start()
@@ -1523,16 +1544,12 @@ class App:
             )
         except (ValueError, tk.TclError):
             worker_in = 1
-        estimated_chunks = (
-            max(1, math.ceil(float(self._meta.duration_sec) / float(cs)))
-            if self._meta is not None
-            else 1
-        )
+        estimated_chunks = len(frame_ranges(self._meta, cs)) if self._meta is not None else 1
         if worker_in is None:
             cpu = max(1, (os.cpu_count() or 1) // 2)
             dialog_worker_count = min(cpu, estimated_chunks, 4)
         else:
-            dialog_worker_count = worker_in
+            dialog_worker_count = min(estimated_chunks, worker_in)
         dlg = EnhanceDecisionDialog(
             self.root,
             self._decisions,
@@ -1550,7 +1567,9 @@ class App:
 
     def _on_run(self) -> None:
         """「実行」ボタンハンドラ。事前分析が未実施なら analyze → dialog → run を連続実行."""
-        if self._worker_thread is not None and self._worker_thread.is_alive():
+        if self._current_worker_kind is not None or (
+            self._worker_thread and self._worker_thread.is_alive()
+        ):
             messagebox.showwarning("実行中", "既に処理が実行中です。")
             return
         validated = self._validate_common()
@@ -1572,7 +1591,7 @@ class App:
         """ダイアログ確定後の最終出力パスを決める。
 
         出力欄は保存先フォルダとして扱う。最終ファイル名は、ダイアログで確定した
-        `dec_result` から実行スペック名を再計算して `<出力フォルダ>/<入力名>_<spec>.<ext>` にする。
+        `dec_result` から実行スペック名を再計算して `<出力フォルダ>/<入力名>_<spec>.mp4` にする。
         """
         out_str = self.var_output.get().strip()
         try:
@@ -1593,6 +1612,7 @@ class App:
         """analyze 完了後（または事前分析済み）のステージ選択ダイアログ表示 → run 起動."""
         validated = self._validate_common()
         if validated is None:
+            self._cleanup_temp_run()
             return
         input_path, _pre_output, chunk_seconds, _ = validated
 
@@ -1615,6 +1635,16 @@ class App:
                 self._cleanup_temp_run()
                 return
 
+        hdr_to_sdr = self.var_hdr_to_sdr.get()
+        if hdr := pipeline.color.hdr_name(self._meta):
+            if not hdr_to_sdr:
+                messagebox.showerror(
+                    "HDR入力",
+                    f"{hdr} HDR入力です。「HDRをSDR（BT.709）に変換」を選択してください。",
+                )
+                self._cleanup_temp_run()
+                return
+            self._append_log(f"[color] {hdr} HDR → BT.709 SDR")
         dec_result = self._open_decision_dialog()
         if dec_result is None:
             self._append_log("[cancelled] ステージ選択ダイアログでキャンセルされました")
@@ -1622,6 +1652,7 @@ class App:
             self._cleanup_temp_run()
             return
 
+        decisions_mod.finalize_interpolation(dec_result, self._meta.fps)
         face = decisions_by_key(dec_result).get("face_restore")
         if (
             face is not None
@@ -1672,12 +1703,12 @@ class App:
             messagebox.showerror("入力エラー", str(e))
             self._cleanup_temp_run()
             return
-        estimated_chunks = max(1, math.ceil(float(self._meta.duration_sec) / float(chunk_seconds)))
+        estimated_chunks = len(frame_ranges(self._meta, chunk_seconds))
         if worker_in is None:
             cpu = max(1, (os.cpu_count() or 1) // 2)
             effective_worker_count = min(cpu, estimated_chunks, 4)
         else:
-            effective_worker_count = worker_in
+            effective_worker_count = min(estimated_chunks, worker_in)
         if not self._estimate_temp_and_abort_if_exceed(
             dec_result,
             chunk_seconds,
@@ -1801,6 +1832,9 @@ class App:
         meta = self._meta
         decs_local = dec_result
         self._current_worker_kind = "run"
+        keep_temp = self.var_keep_temp.get()
+        temp_run, self._temp_run = self._temp_run, None
+        self._keep_analysis_temp = False
 
         def _log_cb(msg: str) -> None:
             self._eventq.write(msg)
@@ -1822,7 +1856,7 @@ class App:
                     decisions=decs_local,
                     meta=meta,
                     chunk_seconds=chunk_seconds,
-                    keep_temp=bool(self.var_keep_temp.get()),
+                    keep_temp=keep_temp,
                     log=_log_cb,
                     cancel_event=cancel_event,
                     progress=_progress_cb,
@@ -1830,40 +1864,40 @@ class App:
                     ffprobe=ffprobe_rb.path,
                     realesrgan=realesrgan_path,
                     rife=rife_path,
+                    rife_model_parent=rife_models_dir if rife_path else None,
+                    hdr_to_sdr=hdr_to_sdr,
                     codeformer=codeformer_local,
                     face_restore_options=face_restore_options,
                     stabilize_backend=stabilize_backend,
                     worker_count=effective_worker_count,
                     gpu_concurrency=gpu_concurrency,
                     io_idle_timeout_sec=io_idle_timeout_sec,
-                    temp_run=self._temp_run,
+                    temp_run=temp_run,
                     estimated_peak_temp_bytes=math.ceil(peak_gib * (1024**3)),
                 )
                 self._eventq.write(f"[OK] saved: {saved_path or output_path}")
-                self._eventq.finish(_FinishEvent("success"))
+                event = _FinishEvent("success")
             except pipeline.PipelineCancelled as e:
                 self._eventq.write(f"[CANCELLED] {e}")
-                self._eventq.finish(_FinishEvent("cancelled"))
+                event = _FinishEvent("cancelled")
             except pipeline.PipelineError as e:
                 self._eventq.write(f"[FAIL] stage={e.stage}: {e.message}")
-                self._eventq.finish(_FinishEvent("failed", message=str(e)))
+                event = _FinishEvent("failed", message=str(e))
             except MissingDependencyError as e:
                 self._eventq.write(f"[ERROR] {e}")
-                self._eventq.finish(_FinishEvent("failed", message=str(e)))
+                event = _FinishEvent("failed", message=str(e))
             except Exception as e:  # noqa: BLE001
                 self._eventq.write(f"[ERROR] {type(e).__name__}: {e}")
-                self._eventq.finish(_FinishEvent("failed", message=str(e)))
-            finally:
-                if not bool(self.var_keep_temp.get()):
-                    self._cleanup_temp_run(log_to_eventq=True)
+                event = _FinishEvent("failed", message=str(e))
+            if not keep_temp:
+                event = self._finish_cleanup(temp_run, event)
+            self._eventq.finish(event)
 
         self._worker_thread = threading.Thread(target=_worker, daemon=True)
         self._worker_thread.start()
 
     def _on_cancel(self) -> None:
-        if self._cancel_event is None or self._worker_thread is None:
-            return
-        if not self._worker_thread.is_alive():
+        if self._cancel_event is None or self._current_worker_kind is None:
             return
         self._cancel_event.set()
         self.btn_cancel.configure(state="disabled")
@@ -1873,6 +1907,11 @@ class App:
     def _on_close(self) -> None:
         worker_running = self._worker_thread is not None and self._worker_thread.is_alive()
         if not worker_running:
+            if self._current_worker_kind is not None:
+                self._close_requested = True
+                self._pending_run_after_analyze = False
+                return
+            self._cleanup_temp_run()
             try:
                 self.root.destroy()
             except tk.TclError:
@@ -1968,21 +2007,45 @@ class App:
             self.var_progress_label.set("完了")
             return
 
-    def _cleanup_temp_run(self, *, log_to_eventq: bool = False) -> None:
+    def _finish_cleanup(self, temp_run, event: _FinishEvent) -> _FinishEvent:
+        try:
+            temp_workspace.cleanup_temp_run(temp_run)
+        except temp_workspace.TempWorkspaceError as exc:
+            message = f"cleanup failed; temporary files remain at {temp_run.run_leaf}: {exc}"
+            self._eventq.write(f"[WARN] {message}")
+            return replace(event, status="failed", message=message)
+        return event
+
+    def _cleanup_temp_run(self) -> None:
         temp_run = self._temp_run
         if temp_run is None:
+            return
+        if self._keep_analysis_temp:
+            self._append_log(f"[keep-temp] {temp_run.run_leaf}")
+            self._temp_run = None
+            self._keep_analysis_temp = False
             return
         try:
             temp_workspace.cleanup_temp_run(temp_run)
             self._temp_run = None
         except temp_workspace.TempWorkspaceError as exc:
             message = f"[WARN] cleanup failed; temporary files remain at {temp_run.run_leaf}: {exc}"
-            if log_to_eventq:
-                self._eventq.write(message)
-            else:
-                self._append_log(message)
+            self._append_log(message)
 
     def _handle_finish(self, ev: _FinishEvent) -> None:
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self.root.after(20, lambda: self._handle_finish(ev))
+            return
+        self._worker_thread = None
+        if ev.temp_run is not None:
+            self._temp_run = ev.temp_run
+            self._keep_analysis_temp = ev.keep_temp
+        if ev.generation is not None and ev.status == "success":
+            cancelled = self._cancel_event is not None and self._cancel_event.is_set()
+            if ev.generation != self._analysis_generation or self._close_requested or cancelled:
+                ev = replace(ev, status="cancelled")
+            else:
+                self._meta, self._decisions = ev.meta, ev.decisions
         self.btn_run.configure(state="normal")
         self.btn_analyze.configure(state="normal")
         self.btn_cancel.configure(state="disabled")

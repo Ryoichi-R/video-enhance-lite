@@ -401,10 +401,12 @@ class _MismatchedCodeFormerRunner:
         out_dir = Path(argv[argv.index("--output_path") + 1]) / "final_results"
         out_dir.mkdir(parents=True, exist_ok=True)
         _write_png(out_dir / "99999999.png", 250)
+        _write_png(out_dir / "00000001.png", 130)
         return 0
 
 
-def test_face_restore_naturalize_requires_name_match_and_skips_position_fallback(tmp_path):
+@pytest.mark.parametrize("blend,expected", [(0.5, 80), (1.0, 130)])
+def test_face_restore_uses_only_matching_names(tmp_path, blend, expected):
     codeformer = _fake_codeformer(tmp_path)
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
@@ -413,6 +415,7 @@ def test_face_restore_naturalize_requires_name_match_and_skips_position_fallback
     for path in (input_dir, output_dir, selected_dir, raw_dir):
         path.mkdir()
     _write_png(input_dir / "00000000.png", 10)
+    _write_png(input_dir / "00000001.png", 30)
     logs: list[str] = []
 
     count = pipeline._run_face_restore_stage(
@@ -431,10 +434,11 @@ def test_face_restore_naturalize_requires_name_match_and_skips_position_fallback
         gpu_gate=None,
         log=logs.append,
         tag="[chunk 1/1]",
-        options=pipeline.FaceRestoreOptions(blend=0.5),
+        options=pipeline.FaceRestoreOptions(blend=blend),
     )
 
-    assert count == 1
+    assert count == 2
+    assert np.all(_read_png(output_dir / "00000001.png") == expected)
     assert np.all(_read_png(output_dir / "00000000.png") == 10)
     assert "naturalize unmatched frames=1" in "\n".join(logs)
 
@@ -573,7 +577,7 @@ def test_pipeline_face_restore_runs_before_interpolate(workspace, fake_run, tmp_
         log=lambda _: None,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
         codeformer=codeformer,
         face_restore_start_sec=0,
         face_restore_end_sec=10,

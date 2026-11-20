@@ -278,7 +278,7 @@ def test_run_pipeline_interpolate_forwards_log_to_heartbeat(workspace):
         log=logs.append,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
         worker_count=1,
     )
 

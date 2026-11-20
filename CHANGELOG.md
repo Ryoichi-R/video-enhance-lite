@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-11-21
+
+- Partition the output timeline by frame number. Keep held VFR frames and fractional-rate CFR tails, and deinterlace native fields before RGB conversion.
+- Generate MP4 names, preserve pixel aspect, SDR colour and custom metadata, and extend odd edges for H.264. Add explicit PQ/HLG tone mapping to BT.709 in the CLI, GUI and API.
+- Validate RIFE frame sequences, use the selected model directory, skip 1× interpolation and preserve single-frame tails. Match restored faces by frame name.
+- Signal cancellation before joining parallel workers and finish GUI cleanup before closing.
+
+## 0.2.4 — 2026-11-21
+
+- Verify pinned binary hashes before version probes. Isolate concurrent analysis samples and return the retained directory in frame statistics.
+
 ## 0.2.3 — 2026-11-13
 
 - Size frame-rate observation windows by the nominal frame rate and use the full video when

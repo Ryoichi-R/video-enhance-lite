@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from bisect import bisect_left
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -63,7 +64,7 @@ STAGE_REGISTRY: tuple[StageSpec, ...] = (
 PUBLIC_BUILTIN_STAGE_COUNT = sum(spec.public_count for spec in STAGE_REGISTRY)
 PUBLIC_STAGE_COUNT_LABEL = f"{PUBLIC_BUILTIN_STAGE_COUNT}組込み段階 + 任意の顔復元1段階"
 
-PRE_FILTER_ORDER = ("deinterlace", "stabilize", "deflicker", "denoise", "debanding")
+PRE_FILTER_ORDER = ("stabilize", "deflicker", "denoise", "debanding")
 POST_FILTER_ORDER = ("color_correction", "sharpen", "grain")
 
 # vidstab (vidstabdetect / vidstabtransform) に渡す前に強制するピクセルフォーマット。
@@ -102,15 +103,6 @@ def join_filters(parts: Iterable[str]) -> str:
 
 
 # ---------- pre-filter snippets ----------
-
-
-def _snippet_deinterlace(d: StageDecision) -> str:
-    if not d.enabled:
-        return ""
-    # `yadif=0` (send_frame): フレーム毎に 1 枚出力し、フレーム数・実効 fps を不変に保つ。
-    # `yadif=1` (send_field) はフィールド毎 1 枚 = 枚数が倍化するため、固定 framerate で
-    # mux する本パイプラインでは使用不可 (チャンクが 2 倍スロー + 音ズレになる。2026-06 修正)。
-    return "yadif=0"
 
 
 def _snippet_stabilize_transform(d: StageDecision, transforms_path: Path | None) -> str:
@@ -164,9 +156,7 @@ def build_pre_filter_chain(
         d = by.get(key)
         if d is None or not d.enabled:
             continue
-        if key == "deinterlace":
-            parts.append(_snippet_deinterlace(d))
-        elif key == "stabilize":
+        if key == "stabilize":
             if exclude_stabilize:
                 continue
             parts.append(_snippet_stabilize_transform(d, transforms_path))
@@ -229,6 +219,23 @@ def build_resolution_clamp_filter(
     if intermediate_width == target_width:
         return ""
     return f"scale={target_width}:-2:flags={flags}"
+
+
+def build_canvas_filter(meta, upscale) -> str:
+    from .decisions import output_dimensions
+
+    w, h, coded_w, coded_h = output_dimensions(meta, upscale)
+    parts = []
+    if (w, h) != (coded_w, coded_h):
+        parts += [
+            "format=gbrp",
+            f"pad={coded_w}:{coded_h}:0:0",
+            f"fillborders=right={coded_w - w}:bottom={coded_h - h}:mode=smear",
+        ]
+    if sar := getattr(meta, "sample_aspect_ratio", None):
+        adjusted = Fraction(sar) * Fraction(meta.width * h, meta.height * w)
+        parts.append(f"setsar={adjusted.numerator}/{adjusted.denominator}:max=65535")
+    return join_filters(parts)
 
 
 def build_post_filter_chain(decisions: list[StageDecision]) -> str:
@@ -421,6 +428,13 @@ def build_encode_args(decision: StageDecision, hw_backend: str = "none") -> list
 # ---------- RIFE ----------
 
 
+def rife_output_count(input_frames: int, source_fps: Fraction, target_fps: Fraction) -> int:
+    ratio = Fraction(target_fps) / Fraction(source_fps)
+    if ratio.denominator != 1 or ratio < 1:
+        raise ValueError(f"target_fps must be an integer multiple of source_fps; ratio={ratio}")
+    return input_frames * ratio.numerator
+
+
 def build_rife_args(
     rife_bin: Path,
     in_dir: Path,
@@ -431,6 +445,7 @@ def build_rife_args(
     model: str | None = None,
     threads: str | None = None,
     gpu_id: int | None = None,
+    model_path: Path | None = None,
 ) -> list[str]:
     """RIFE-ncnn-vulkan の引数を組み立てる.
 
@@ -461,7 +476,7 @@ def build_rife_args(
             f"target_fps {target_fps} must be an integer multiple of source_fps {source_fps}; "
             f"ratio={ratio}"
         )
-    n_out = input_frame_count * int(ratio)
+    n_out = rife_output_count(input_frame_count, src, tgt)
     chosen_model = model if model else config.DEFAULT_RIFE_MODEL
     # RIFE は長時間処理中の既定出力が乏しいため、保存完了行を idle watchdog の
     # 生存信号として常時利用する。位置は外部契約にせず、両 return 共通で1個だけ付与する。
@@ -484,7 +499,7 @@ def build_rife_args(
         return [
             str(rife_bin),
             "-m",
-            chosen_model,
+            str(model_path or chosen_model),
             "-i",
             str(in_dir),
             "-o",
@@ -495,7 +510,7 @@ def build_rife_args(
     return [
         str(rife_bin),
         "-m",
-        chosen_model,
+        str(model_path or chosen_model),
         "-i",
         str(in_dir),
         "-o",
@@ -614,6 +629,12 @@ def build_extract_args(
     *,
     vf_chain: str = "",
     normalization_fps: Fraction | None = None,
+    source_fps: Fraction | None = None,
+    first_frame: int | None = None,
+    field_order: str | None = None,
+    video_start: float = 0.0,
+    keyframes: tuple[float, ...] = (),
+    color_filter: str = "",
     expected_frame_count: int | None = None,
     video_start_offset_sec: float = 0.0,
     per_stream_timestamp_rebase: bool = False,
@@ -633,34 +654,61 @@ def build_extract_args(
         ".m2ts",
     }
     argv = [str(ffmpeg), "-y"]
-    if not transport_stream:
-        # Input seeking counts from the container start.
+    filter_parts = []
+    rate = normalization_fps or source_fps
+    if rate is not None and rate <= 0:
+        raise ValueError("frame rate must be positive")
+    if expected_frame_count is not None and expected_frame_count < 1:
+        raise ValueError("expected_frame_count must be positive")
+    if rate is not None and first_frame is None:
+        first_frame = round(Fraction(str(start_sec)) * rate)
+    if field_order is not None:
+        parity = {"tt": "tff", "bt": "tff", "bb": "bff", "tb": "bff"}.get(field_order, "auto")
+        filter_parts.append(f"yadif=0:parity={parity}")
+    if normalization_fps is not None:
+        # Start no later than the preceding GOP so the held image and YADIF's
+        # neighbours are available. Missing/discontinuous indexes decode from zero.
+        i = bisect_left(keyframes, start_sec) - 2
+        seek = keyframes[i] if i >= 0 and not transport_stream else 0
+        if seek > 0:
+            argv += ["-copyts", "-ss", f"{video_start_offset_sec + seek - 0.000001:.6f}"]
+            filter_parts.append(f"setpts=PTS-({video_start:.9f})/TB")
+        else:
+            filter_parts.append("setpts=PTS-STARTPTS")
+        trim = f"trim=start_pts={first_frame}"
+        if expected_frame_count is not None:
+            trim += f":end_pts={first_frame + expected_frame_count}"
+        filter_parts.extend(
+            [
+                f"fps={normalization_fps.numerator}/{normalization_fps.denominator}",
+                trim,
+                "setpts=PTS-STARTPTS",
+            ]
+        )
+    elif rate is not None and first_frame is not None:
+        seek_frame = (
+            max(0, first_frame - int(field_order is not None)) if not transport_stream else 0
+        )
+        if seek_frame:
+            # Land between this frame and its predecessor even on coarse time bases.
+            seek = video_start_offset_sec + float((seek_frame - Fraction(1, 2)) / rate)
+            argv += ["-ss", f"{seek:.9f}"]
+        trim_start = first_frame - seek_frame
+        if trim_start or expected_frame_count is not None:
+            trim = f"trim=start_frame={trim_start}"
+            if expected_frame_count is not None:
+                trim += f":end_frame={trim_start + expected_frame_count}"
+            filter_parts.extend([trim, "setpts=PTS-STARTPTS"])
+    elif not transport_stream:
         argv += ["-ss", f"{start_sec + video_start_offset_sec}"]
     argv += ["-i", str(input_path)]
-    if transport_stream:
-        # FFmpeg rebases MPEG-PS/TS on the streams in use; this command reads only
-        # video, so the output timeline already starts at the first video frame.
+    if rate is None and transport_stream:
         argv += ["-ss", f"{start_sec}"]
-    if normalization_fps is not None:
-        normalization_fps = Fraction(normalization_fps)
-        if normalization_fps <= 0:
-            raise ValueError(f"normalization_fps must be > 0, got {normalization_fps}")
-        if expected_frame_count is not None and expected_frame_count < 1:
-            raise ValueError(f"expected_frame_count must be >= 1, got {expected_frame_count}")
-    elif expected_frame_count is not None:
-        raise ValueError("expected_frame_count requires normalization_fps")
-
-    argv += [
-        "-t",
-        f"{dur_sec}",
-        "-fps_mode",
-        "cfr" if normalization_fps is not None else "passthrough",
-        "-start_number",
-        "0",
-    ]
-    filter_parts: list[str] = []
-    if normalization_fps is not None:
-        filter_parts.append(f"fps={normalization_fps.numerator}/{normalization_fps.denominator}")
+    if expected_frame_count is None:
+        argv += ["-t", f"{dur_sec}"]
+    argv += ["-fps_mode", "cfr" if normalization_fps else "passthrough", "-start_number", "0"]
+    if color_filter:
+        filter_parts.append(color_filter)
     if vf_chain:
         filter_parts.append(vf_chain)
     if filter_parts:

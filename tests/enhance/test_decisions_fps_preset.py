@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
 
+import pytest
+
 
 from video_enhance_lite import config, decisions
 
@@ -139,3 +141,15 @@ def test_keep_source_fps_differs_from_auto():
     )
     assert auto.recommended is True  # auto -> ×2 補間
     assert keep.recommended is False  # keep -> 現状維持
+
+
+@pytest.mark.parametrize("request_fps,enable,mult", [(30, False, 1), (60, True, 2)])
+def test_ntsc_rounding_precedes_interpolation(request_fps, enable, mult):
+    rate = Fraction(30000, 1001)
+    stage = _interp(
+        decisions.recommend(
+            FakeMeta(fps=rate), FakeStats(), defaults=_explicit_defaults(request_fps)
+        )
+    )
+    assert stage.enabled == enable and stage.recommended == enable
+    assert Fraction(stage.params["target_fps_num"], stage.params["target_fps_den"]) == rate * mult

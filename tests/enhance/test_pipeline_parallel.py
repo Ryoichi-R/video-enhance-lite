@@ -241,3 +241,40 @@ def test_worker_count_external_cancel_stops(workspace, fake_run):
             ffprobe=Path(r"C:\bin\ffprobe.exe"),
             worker_count=3,
         )
+
+
+def test_keyboard_interrupt_signals_running_workers_before_pool_exit(workspace, monkeypatch):
+    from threading import Barrier, Event
+    from tests.enhance.test_pipeline import _make_decisions, FakeMeta
+
+    monkeypatch.setenv(pipeline.config.ENV_TEMP_ROOT, str(workspace / "temp"))
+    ready = Barrier(3)
+    cancel = Event()
+    started, observed = [], []
+
+    def wait_worker(*, chunk_idx, cancel_event, **kwargs):
+        started.append(chunk_idx)
+        ready.wait(timeout=5)
+        observed.append(cancel_event.wait(5))
+        raise pipeline.PipelineCancelled("worker stopped")
+
+    def interrupt(_futures):
+        ready.wait(timeout=5)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipeline, "_process_chunk", wait_worker)
+    monkeypatch.setattr(pipeline.concurrent.futures, "as_completed", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.run_pipeline(
+            input_path=workspace / "in.mp4",
+            output_path=workspace / "out.mp4",
+            decisions=_make_decisions(),
+            meta=FakeMeta(duration_sec=6),
+            chunk_seconds=1,
+            worker_count=2,
+            ffmpeg=Path("ffmpeg"),
+            ffprobe=Path("ffprobe"),
+            cancel_event=cancel,
+        )
+    assert sorted(started) == [0, 1] and observed == [True, True]
+    assert not list((workspace / "temp").rglob("chunk_*.mp4"))

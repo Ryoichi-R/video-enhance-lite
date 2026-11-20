@@ -22,6 +22,9 @@ from tests.support.process_runner import FakeProcessRunner  # noqa: E402
 def workspace(tmp_path, monkeypatch):
     """WORKSPACE_ROOT を tmp_path に差し替えた作業ディレクトリ (出力ポリシー検証用)。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", tmp_path)
+    model = tmp_path / config.DEFAULT_RIFE_MODEL
+    model.mkdir()
+    (model / "flownet.param").touch()
     return tmp_path
 
 

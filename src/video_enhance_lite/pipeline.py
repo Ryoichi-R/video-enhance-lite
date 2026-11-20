@@ -13,13 +13,13 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Protocol
 
-from . import config, deps, framerate, media_streams, stages, temp_workspace
-from .decisions import StageDecision, decisions_by_key
+from . import color, config, deps, framerate, media_streams, mp4_metadata, stages, temp_workspace
+from .decisions import StageDecision, decisions_by_key, finalize_interpolation
 
 try:
     from . import stabilize_cv  # type: ignore
@@ -1093,14 +1093,10 @@ def _run_face_restore_stage(
     resized = 0
     empty_mask = 0
     output_by_name = {p.name: p for p in sorted(final_results.glob("*.png"))}
-    fallback_outputs = sorted(final_results.glob("*.png"))
-    for i, selected_frame in enumerate(selected):
+    for selected_frame in selected:
         out = output_by_name.get(selected_frame.name)
-        if out is None and not needs_composite and i < len(fallback_outputs):
-            out = fallback_outputs[i]
         if out is None or not out.is_file():
-            if needs_composite:
-                unmatched += 1
+            unmatched += 1
             continue
         if needs_composite:
             result = _compose_face_restore_frame(
@@ -1180,7 +1176,7 @@ def estimate_peak_temp_bytes(
     h_ratio = height / width
     h = int(w * h_ratio)
     f = effective_fps if effective_fps is not None else fps
-    frames_per_chunk = float(f) * float(chunk_seconds)
+    frames_per_chunk = math.ceil(f * chunk_seconds)
     raw = w * h * bytes_per_pixel * frames_per_chunk * concurrent_dirs
     return int(raw * float(png_compression_ratio) * max(1, int(worker_count)))
 
@@ -1308,6 +1304,7 @@ def _run_gpu_stage(
         run_kwargs["env"] = env
     if gpu_gate is not None:
         with gpu_gate:
+            _check_cancel(cancel_event, stage, chunk_idx=chunk_idx)
             runner.run_with_progress(argv, **run_kwargs)
     else:
         runner.run_with_progress(argv, **run_kwargs)
@@ -1319,11 +1316,16 @@ def _process_chunk(
     ffmpeg: Path,
     realesrgan: Path | None,
     rife: Path | None,
+    rife_model_path: Path | None = None,
     codeformer: deps.ResolvedCodeFormerLocal | None,
     input_path: Path,
     fps: Fraction,
     normalization_fps: Fraction | None,
     expected_normalized_frames: int | None,
+    first_frame: int = 0,
+    field_order: str = "unknown",
+    video_start: float = 0.0,
+    keyframes: tuple[float, ...] = (),
     chunk_idx: int,
     start_sec: float,
     dur_sec: float,
@@ -1344,6 +1346,8 @@ def _process_chunk(
     fuse_extract_prefilter: bool = False,
     keep_temp: bool = False,
     source_start_offset_sec: float = 0.0,
+    colors: color.ColorConversion = color.ColorConversion(),
+    canvas: str = "",
     per_stream_timestamp_rebase: bool = False,
 ) -> Path:
     tag = f"[chunk {chunk_idx + 1}/{total_chunks}]"
@@ -1412,12 +1416,18 @@ def _process_chunk(
         dur_sec,
         extract_target,
         vf_chain=fused_chain,
+        color_filter=colors.extract,
+        source_fps=fps,
+        first_frame=first_frame,
+        field_order=field_order if by.get("deinterlace") and by["deinterlace"].enabled else None,
+        video_start=video_start,
+        keyframes=keyframes,
         normalization_fps=normalization_fps,
         expected_frame_count=expected_normalized_frames,
         video_start_offset_sec=source_start_offset_sec,
         per_stream_timestamp_rebase=per_stream_timestamp_rebase,
     )
-    _run_ffmpeg_png_stage(
+    extracted = _run_ffmpeg_png_stage(
         extract_argv,
         runner=runner,
         stage=failure_stage,
@@ -1429,8 +1439,14 @@ def _process_chunk(
         io_idle_timeout_sec=io_idle_timeout_sec,
         out_dir=extract_target,
         empty_error="no frames extracted",
-        require_count=False,
+        require_count=True,
     )
+    if expected_normalized_frames is not None and extracted != expected_normalized_frames:
+        raise PipelineError(
+            failure_stage,
+            f"expected {expected_normalized_frames} frames, got {extracted}",
+            chunk_idx=chunk_idx,
+        )
 
     # ---- stabilize detect (only if stabilize ON, vidstab backend) ----
     # P2-3: フレーム 2 枚未満の端数チャンク (duration の余りが 1 フレーム分未満の
@@ -1742,15 +1758,18 @@ def _process_chunk(
     # P2-3: フレーム 2 枚未満の端数チャンクでは補間ペアが成立しない (rife-ncnn-vulkan
     # は連続 2 フレーム間の中間フレームを生成する)。stabilize と同様にこのチャンク
     # のみスキップして pass-through する (発生は端数 0.0x 秒の最終チャンクのみ)。
+    if interp_enabled:
+        target_fps = Fraction(
+            interp_dec.params["target_fps_num"], interp_dec.params["target_fps_den"]
+        )
+    else:
+        target_fps = fps
     if interp_enabled and rife_input_count < 2:
         log(f"       {tag} interpolate skipped (frames < 2)")
         interp_enabled = False
     if interp_enabled:
         if rife is None:
             raise PipelineError("interpolate", "rife binary not available", chunk_idx=chunk_idx)
-        tgt_num = int(interp_dec.params.get("target_fps_num", fps.numerator * 2))
-        tgt_den = int(interp_dec.params.get("target_fps_den", fps.denominator))
-        target_fps = Fraction(tgt_num, tgt_den)
         log(f"       {tag} interpolate  {float(fps):.3f} -> {float(target_fps):.3f} fps")
         _emit_progress(
             progress,
@@ -1764,20 +1783,23 @@ def _process_chunk(
         rife_resolved_gpu = (
             gpu_opts.rife_gpu_id if gpu_opts.rife_gpu_id is not None else gpu_opts.gpu_id
         )
+        model = interp_dec.params.get("model") or config.DEFAULT_RIFE_MODEL
         rife_argv = stages.build_rife_args(
-            rife_bin=rife,
+            rife_bin=rife.resolve(),
             in_dir=rife_input_dir,
             out_dir=frames_rife,
             source_fps=fps,
             target_fps=target_fps,
             input_frame_count=rife_input_count,
-            model=interp_dec.params.get("model"),
+            model=model,
+            model_path=rife_model_path,
             threads=gpu_opts.threads,
             gpu_id=rife_resolved_gpu,
         )
         # RIFE verbose は idle 生存信号として使い、GUIには低頻度 heartbeat だけを流す。
         _run_gpu_stage(
             rife_argv,
+            cwd=rife.resolve().parent,
             runner=runner,
             stage="interpolate",
             chunk_idx=chunk_idx,
@@ -1786,10 +1808,26 @@ def _process_chunk(
             gpu_gate=gpu_gate,
             log=log,
         )
-        mux_fps = target_fps
+        expected = stages.rife_output_count(rife_input_count, fps, target_fps)
+        files = {p.name for p in frames_rife.glob("*.png") if p.is_file()}
+        missing = [
+            name
+            for i in range(1, expected + 1)
+            if (name := f"{i:08d}.png") not in files or (frames_rife / name).stat().st_size == 0
+        ]
+        if len(files) != expected or missing:
+            raise PipelineError(
+                "interpolate",
+                f"expected {expected} frames, got {len(files)}; missing or empty: {missing[:10]}",
+                chunk_idx=chunk_idx,
+            )
     else:
         _rename_dir_contents(rife_input_dir, frames_rife)
-        mux_fps = fps
+        if target_fps > fps and rife_input_count == 1:
+            single = next(frames_rife.glob("*.png"))
+            for i in range(1, int(target_fps / fps)):
+                _link_or_copy_atomic(single, frames_rife / f"{int(single.stem) + i:08d}.png")
+    mux_fps = target_fps
 
     # V2-7: rife 出力枚数 (magnitude) は後段で使わないため存在判定で十分。
     if not _has_png(frames_rife):
@@ -1852,6 +1890,7 @@ def _process_chunk(
             fps=mux_fps,
             chunk_path=chunk_path,
             encode_args=encode_args,
+            vf_chain=stages.join_filters([canvas, colors.encode]),
         )
         mux_argv = _augment_ffmpeg_with_progress(mux_argv)
         runner.run_with_progress(
@@ -1879,7 +1918,7 @@ def _process_chunk(
             fps=mux_fps,
             chunk_path=chunk_path,
             encode_args=encode_args,
-            vf_chain=post_chain,
+            vf_chain=stages.join_filters([post_chain, canvas, colors.encode]),
         )
         mux_argv = _augment_ffmpeg_with_progress(mux_argv)
         runner.run_with_progress(
@@ -1934,6 +1973,9 @@ def _concat_chunks(
     io_idle_timeout_sec: int = DEFAULT_IO_IDLE_TIMEOUT_SEC,
     video_itsoffset_sec: float = 0.0,
     source_itsoffset_sec: float = 0.0,
+    tone_mapped: bool = False,
+    title: str | None = None,
+    chunk_durations: list[Fraction] | None = None,
 ) -> Path:
     """Mux the chunks with the source streams; return the published output path.
 
@@ -1941,7 +1983,15 @@ def _concat_chunks(
     removes it, so the final name only ever holds a complete file.
     """
     list_path = chunks_dir / "concat_list.txt"
-    lines = [f"file '{p.name}'\n" for p in chunk_paths]
+    lines = []
+    elapsed = Fraction(0)
+    for index, path in enumerate(chunk_paths):
+        lines.append(f"file '{path.name}'\n")
+        if chunk_durations is not None:
+            previous_us = round(elapsed * 1_000_000)
+            elapsed += chunk_durations[index]
+            duration_us = round(elapsed * 1_000_000) - previous_us
+            lines.append(f"duration {duration_us / 1_000_000:.6f}\n")
     list_path.write_text("".join(lines), encoding="utf-8")
     partial_path = _partial_output_path(output_path)
     keep_partial = False
@@ -1982,6 +2032,10 @@ def _concat_chunks(
         "1",
         "-map_metadata:s:v:0",
         "1:s:v:0",
+        "-metadata:s:v:0",
+        "rotate=",
+        "-metadata:s:v:0",
+        "encoder=",
         "-c:v",
         "copy",
     ]
@@ -2006,7 +2060,37 @@ def _concat_chunks(
                 f"-disposition:s:{output_index}",
                 disposition,
             ]
-    argv += ["-t", f"{duration_sec:.6f}"]
+    if title:
+        argv += ["-metadata", "title="]
+    if tone_mapped:
+        for key in (
+            "mastering_display_metadata",
+            "master-display",
+            "max_cll",
+            "max-cll",
+            "MaxCLL",
+            "MaxFALL",
+            "content_light_level",
+            "color_trc",
+            "color_transfer",
+            "color_primaries",
+            "colorspace",
+        ):
+            argv += ["-metadata", f"{key}=", "-metadata:s:v:0", f"{key}="]
+    argv += [
+        "-movflags",
+        "use_metadata_tags",
+        "-metadata",
+        "encoder=",
+        "-metadata",
+        "major_brand=",
+        "-metadata",
+        "minor_version=",
+        "-metadata",
+        "compatible_brands=",
+        "-t",
+        f"{duration_sec:.6f}",
+    ]
     argv += [str(partial_path)]
     argv = _augment_ffmpeg_with_progress(argv)
     try:
@@ -2020,6 +2104,12 @@ def _concat_chunks(
         )
         if not partial_path.is_file():
             raise PipelineError("concat", f"ffmpeg produced no output: {partial_path}")
+        if title:
+            try:
+                mp4_metadata.write_native_title(partial_path, title)
+            except (OSError, ValueError) as exc:
+                raise PipelineError("concat", f"could not preserve MP4 title: {exc}") from exc
+        _check_cancel(cancel_event, "concat")
         try:
             return _publish_output_without_overwrite(partial_path, output_path)
         except OSError as exc:
@@ -2075,6 +2165,7 @@ def run_pipeline(
     ffprobe: Path | None = None,
     realesrgan: Path | None = None,
     rife: Path | None = None,
+    rife_model_parent: Path | None = None,
     codeformer: deps.ResolvedCodeFormerLocal | None = None,
     io_idle_timeout_sec: int = DEFAULT_IO_IDLE_TIMEOUT_SEC,
     face_restore_idle_timeout_sec: int = config.DEFAULT_FACE_RESTORE_IDLE_TIMEOUT_SEC,
@@ -2097,6 +2188,7 @@ def run_pipeline(
     hw_encode: str = "none",
     temp_run: temp_workspace.TempRunContext | None = None,
     estimated_peak_temp_bytes: int | None = None,
+    hdr_to_sdr: bool = False,
 ) -> Path:
     """Run the hybrid 4-pass enhance pipeline and return the saved output path.
 
@@ -2126,6 +2218,10 @@ def run_pipeline(
     # Resolve once before passing the path to ffmpeg.
     output_path = config.validate_output_path(Path(output_path))
 
+    try:
+        colors = color.conversion(meta, hdr_to_sdr)
+    except ValueError as exc:
+        raise PipelineError("color_preflight", str(exc)) from exc
     stream_plan = resolve_stream_preservation(meta, log=log)
     framerate_plan = resolve_framerate_normalization(meta, log=log)
 
@@ -2134,6 +2230,10 @@ def run_pipeline(
     except ValueError as exc:
         raise PipelineError("output_preflight", str(exc)) from exc
 
+    decisions = [
+        replace(d, params=dict(d.params)) if d.key == "interpolate" else d for d in decisions
+    ]
+    finalize_interpolation(decisions, meta.fps)
     by = decisions_by_key(decisions)
     encode_dec = by.get("encode")
     if encode_dec is None:
@@ -2189,12 +2289,35 @@ def run_pipeline(
             ffmpeg = deps.check_ffmpeg().path
     if ffprobe is None:
         ffprobe = deps.check_ffprobe().path
+    if color.hdr_name(meta):
+        try:
+            _run_short(color.probe_args(ffmpeg, input_path, colors), stage="color_preflight")
+        except subprocess.CalledProcessError as exc:
+            raise PipelineError(
+                "color_preflight",
+                f"HDR conversion requires working zscale and tonemap: {exc.stderr}",
+            ) from exc
+        log(f"[color] {color.hdr_name(meta)} HDR → BT.709 SDR")
+    encode_args.extend(colors.tags)
     upscale_dec = by.get("upscale")
+    canvas = stages.build_canvas_filter(meta, upscale_dec)
     if realesrgan is None and upscale_dec is not None and upscale_dec.enabled:
         realesrgan = deps.check_realesrgan().path
     interp_dec = by.get("interpolate")
     if rife is None and interp_dec is not None and interp_dec.enabled:
         rife = deps.check_rife().path
+    rife_model_path = None
+    if rife is not None and interp_dec is not None and interp_dec.enabled:
+        model = interp_dec.params.get("model") or config.DEFAULT_RIFE_MODEL
+        exe_dir = rife.resolve().parent
+        try:
+            parent = rife_model_parent or config.resolve_rife_model_dir(exe_dir, model)
+            config.validate_rife_model(parent, model)
+            # RIFE infers the generation by searching the entire -m argument.
+            # Keep installation ancestors out of it even when cwd is reset by a launcher.
+            rife_model_path = (parent.resolve() / model).relative_to(exe_dir)
+        except (ValueError, OSError) as exc:
+            raise PipelineError("interpolate", f"invalid RIFE model {model}: {exc}") from exc
     if codeformer is None and face_dec is not None and face_dec.enabled:
         codeformer = deps.check_codeformer_local()
 
@@ -2207,7 +2330,15 @@ def run_pipeline(
     if not math.isfinite(video_start_offset) or video_start_offset < 0:
         raise ValueError(f"invalid video start offset: {video_start_offset!r}")
 
-    ranges = _compute_chunk_ranges(duration, chunk_seconds)
+    frame_ranges = framerate.frame_ranges(meta, chunk_seconds)
+    if len(frame_ranges) > 1 and min(end - first for first, end in frame_ranges) <= 3:
+        # Very short H.264 segments can have a shorter reorder delay than their
+        # neighbours. Use one decode clock when stream-copying them into the MP4.
+        encode_args.extend(["-bf", "0"])
+    ranges = [
+        (float(first / fps), float((end - first) / fps), i)
+        for i, (first, end) in enumerate(frame_ranges)
+    ]
     log(
         f"[pipeline] fps={fps} audio={'yes' if has_audio else 'no'} "
         f"duration={duration:.2f}s chunks={len(ranges)} (chunk_seconds={chunk_seconds})"
@@ -2302,15 +2433,16 @@ def run_pipeline(
             ffmpeg=ffmpeg,
             realesrgan=realesrgan,
             rife=rife,
+            rife_model_path=rife_model_path,
             codeformer=codeformer,
             input_path=input_path,
             fps=fps,
             normalization_fps=framerate_plan.normalization_fps,
-            expected_normalized_frames=(
-                _normalized_frame_count(start_sec, dur_sec, fps)
-                if framerate_plan.requires_normalization
-                else None
-            ),
+            expected_normalized_frames=frame_ranges[idx][1] - frame_ranges[idx][0],
+            first_frame=frame_ranges[idx][0],
+            field_order=getattr(meta, "field_order", "unknown"),
+            video_start=getattr(meta, "video_start_sec", 0.0),
+            keyframes=getattr(meta, "keyframe_times", ()),
             chunk_idx=idx,
             start_sec=start_sec,
             dur_sec=dur_sec,
@@ -2340,6 +2472,8 @@ def run_pipeline(
             ),
             keep_temp=keep_temp,
             source_start_offset_sec=video_start_offset,
+            colors=colors,
+            canvas=canvas,
             per_stream_timestamp_rebase=bool(getattr(meta, "per_stream_timestamp_rebase", False)),
         )
         _emit_progress(
@@ -2355,27 +2489,19 @@ def run_pipeline(
     try:
         chunk_paths_map: dict[int, Path] = {}
         if effective_workers > 1:
-            errors: list[BaseException] = []
-            errors_lock = threading.Lock()
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
-                    futures = [pool.submit(_process_one, r) for r in ranges]
-                    for f in concurrent.futures.as_completed(futures):
-                        try:
-                            idx, cp = f.result()
-                            chunk_paths_map[idx] = cp
-                        except BaseException as e:
-                            with errors_lock:
-                                errors.append(e)
-                            cancel_event.set()
-            except BaseException:
-                # KeyboardInterrupt 等が as_completed の待機中に発生した場合も、
-                # ワーカーへ cancel を伝えてから抜ける。これが無いと with __exit__ の
-                # shutdown(wait=True) が走行中ワーカーの完走を待ってブロックする。
-                cancel_event.set()
-                raise
-            if errors:
-                raise errors[0]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
+                futures = []
+                try:
+                    for item in ranges:
+                        futures.append(pool.submit(_process_one, item))
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, cp = future.result()
+                        chunk_paths_map[idx] = cp
+                except BaseException:
+                    cancel_event.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
             chunk_paths = [chunk_paths_map[i] for i in range(len(ranges))]
         else:
             chunk_paths = []
@@ -2385,12 +2511,14 @@ def run_pipeline(
 
         _check_cancel(cancel_event, "concat")
         _emit_progress(progress, "concat", total_chunks=len(ranges), label="concatenating")
-        video_shift, source_shift, output_duration = _mux_alignment(meta, duration)
+        video_duration = float(frame_ranges[-1][1] / fps)
+        video_shift, source_shift, output_duration = _mux_alignment(meta, video_duration)
         saved_path = _concat_chunks(
             runner=runner,
             ffmpeg=ffmpeg,
             chunks_dir=tmp_dirs["chunks"],
             chunk_paths=chunk_paths,
+            chunk_durations=[(end - first) / fps for first, end in frame_ranges],
             input_path=input_path,
             stream_plan=stream_plan,
             # Processing follows the video duration. Muxing retains leading and
@@ -2402,6 +2530,8 @@ def run_pipeline(
             io_idle_timeout_sec=io_idle_timeout_sec,
             video_itsoffset_sec=video_shift,
             source_itsoffset_sec=source_shift,
+            tone_mapped=bool(color.hdr_name(meta)),
+            title=getattr(meta, "title", None),
         )
         if saved_path != output_path:
             log(f"[WARN] {output_path} appeared during processing; saved as {saved_path}")

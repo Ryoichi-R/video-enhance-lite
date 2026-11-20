@@ -510,3 +510,24 @@ def test_verify_rife_sha256_policy_expected_reports_verified(monkeypatch):
     assert res.level == "info"
     assert "BinaryPolicy" in res.message
     assert "known-hash table empty" not in res.message
+
+
+@pytest.mark.parametrize(
+    "digest,expected,launch",
+    [("a", "b", False), (None, "b", False), ("a", "a", True), (None, None, True)],
+)
+def test_hash_precedes_version_probe(tmp_path, monkeypatch, digest, expected, launch):
+    exe = tmp_path / "ffmpeg.exe"
+    _write_fake_binary(exe, b"mock")
+    calls = []
+    monkeypatch.setattr(config, "compute_sha256", lambda *a, **kw: calls.append("hash") or digest)
+    monkeypatch.setattr(deps, "_get_version", lambda p: calls.append("version"))
+    policy = config.BinaryPolicy(
+        {"ffmpeg": (tmp_path,)}, {"ffmpeg": (expected,)} if expected else {}
+    )
+    if launch:
+        assert deps._validate_resolved("ffmpeg", exe, policy=policy).sha256 == digest
+    else:
+        with pytest.raises(MissingDependencyError):
+            deps._validate_resolved("ffmpeg", exe, policy=policy)
+    assert calls == (["hash", "version"] if launch else ["hash"])

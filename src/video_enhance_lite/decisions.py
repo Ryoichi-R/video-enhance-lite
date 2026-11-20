@@ -70,7 +70,7 @@ def normalize_target_fps(source_fps: Fraction, target_fps: Fraction) -> tuple[Fr
         raise ValueError(f"target_fps must be > 0, got {target_fps}")
     raw = tgt / src
     # 最も近い正の整数倍 (>=1)
-    n = max(1, round(float(raw)))
+    n = max(1, round(raw))
     normalized = src * n
     if normalized != tgt:
         warning = (
@@ -439,7 +439,6 @@ def recommend(
             req = src_fps
         if src_fps >= req:
             # 等値 (==) も OFF 側 (§2.4 / 利用者承認 #3)
-            fallback_fps = src_fps * 2
             decisions.append(
                 _new(
                     "interpolate",
@@ -450,8 +449,8 @@ def recommend(
                         f"のため補間しません"
                     ),
                     params={
-                        "target_fps_num": fallback_fps.numerator,
-                        "target_fps_den": fallback_fps.denominator,
+                        "target_fps_num": src_fps.numerator,
+                        "target_fps_den": src_fps.denominator,
                         "model": config.DEFAULT_RIFE_MODEL,
                     },
                 )
@@ -466,7 +465,7 @@ def recommend(
                 reason += f" (warn: {target_warning})"
             dec = _new(
                 "interpolate",
-                recommended=True,
+                recommended=normalized > src_fps,
                 confidence="high",
                 reason=reason,
                 params={
@@ -476,7 +475,7 @@ def recommend(
                 },
             )
             # プリセット明示指定は「明示同意」として enabled=True で運用 (§3.3)
-            dec.enabled = True
+            dec.enabled = dec.recommended
             decisions.append(dec)
     else:
         # Auto: 現行ロジック維持
@@ -495,7 +494,7 @@ def recommend(
             decisions.append(
                 _new(
                     "interpolate",
-                    recommended=True,
+                    recommended=target_fps > src_fps,
                     confidence="medium",
                     reason=reason,
                     params={
@@ -564,6 +563,20 @@ def decisions_by_key(decisions: list[StageDecision]) -> dict[str, StageDecision]
     return {d.key: d for d in decisions}
 
 
+def finalize_interpolation(decisions: list[StageDecision], source_fps: Fraction) -> None:
+    stage = decisions_by_key(decisions).get("interpolate")
+    if stage is None or not stage.enabled:
+        return
+    source = Fraction(source_fps)
+    requested = Fraction(
+        int(stage.params.get("target_fps_num", source.numerator * 2)),
+        int(stage.params.get("target_fps_den", source.denominator)),
+    )
+    target, _ = normalize_target_fps(source, requested)
+    stage.params.update(target_fps_num=target.numerator, target_fps_den=target.denominator)
+    stage.enabled = target > source
+
+
 def filter_enabled(decisions: list[StageDecision]) -> list[StageDecision]:
     return [d for d in decisions if d.enabled]
 
@@ -594,12 +607,18 @@ class OutputSummary:
     active_stage_labels: tuple[str, ...]
 
 
-def _align_even(value: float) -> int:
-    """ffmpeg の `scale=W:-2` (2 の倍数アライン) と同じ丸め規則。"""
-    n = int(round(value))
-    if n % 2 != 0:
-        n += 1 if n > 0 else -1
-    return max(n, 2)
+def output_dimensions(meta, upscale: StageDecision | None) -> tuple[int, int, int, int]:
+    """Active width/height and even H.264 canvas. Match scale=W:-2 rounding."""
+    width, height = int(meta.width), int(meta.height)
+    if upscale and upscale.enabled:
+        scale = int(upscale.params.get("scale", config.DEFAULT_REALESRGAN_SCALE))
+        target = int(upscale.params.get("target_width", config.DEFAULT_TARGET_WIDTH))
+        if width * scale == target:
+            height *= scale
+        else:
+            height = max(2, 2 * int(Fraction(height * target, 2 * width) + Fraction(1, 2)))
+        width = target
+    return width, height, width + width % 2, height + height % 2
 
 
 def compute_output_summary(meta, decisions: list[StageDecision]) -> OutputSummary:
@@ -624,30 +643,25 @@ def compute_output_summary(meta, decisions: list[StageDecision]) -> OutputSummar
         scale = int(upscale.params.get("scale", config.DEFAULT_REALESRGAN_SCALE))
         target_w = int(upscale.params.get("target_width", config.DEFAULT_TARGET_WIDTH))
         intermediate_w = src_w * scale
-        out_w = target_w
         clamp_applied = intermediate_w != target_w
         clamp_upscale = clamp_applied and target_w > intermediate_w
         upscale_enabled = True
         upscale_scale: int | None = scale
         intermediate: int | None = intermediate_w
     else:
-        out_w = src_w
         clamp_applied = False
         clamp_upscale = False
         upscale_enabled = False
         upscale_scale = None
         intermediate = None
 
-    if src_w > 0:
-        out_h = _align_even(src_h * out_w / src_w)
-    else:
-        out_h = src_h
+    _, _, out_w, out_h = output_dimensions(meta, upscale)
 
     if interpolate is not None and interpolate.enabled:
         num = int(interpolate.params.get("target_fps_num", src_fps.numerator * 2))
         den = int(interpolate.params.get("target_fps_den", src_fps.denominator))
-        out_fps = Fraction(num, den)
-        interp_enabled = True
+        out_fps, _ = normalize_target_fps(src_fps, Fraction(num, den))
+        interp_enabled = out_fps > src_fps
         if src_fps > 0:
             ratio = out_fps / src_fps
             interp_mult: int | None = ratio.numerator if ratio.denominator == 1 else None
@@ -658,7 +672,7 @@ def compute_output_summary(meta, decisions: list[StageDecision]) -> OutputSummar
         interp_enabled = False
         interp_mult = None
 
-    active = [d for d in decisions if d.enabled]
+    active = [d for d in decisions if d.enabled and (d.key != "interpolate" or interp_enabled)]
     return OutputSummary(
         src_width=src_w,
         src_height=src_h,

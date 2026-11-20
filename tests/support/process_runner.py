@@ -81,7 +81,17 @@ class FakeProcessRunner:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 (out_dir / "00000000.png").write_bytes(b"")
                 (out_dir / "00000001.png").write_bytes(b"")
-        elif "realesrgan" in bin_name or "rife" in bin_name:
+        elif stage == "interpolate":
+            dest = Path(argv_list[argv_list.index("-o") + 1])
+            source = Path(argv_list[argv_list.index("-i") + 1])
+            count = (
+                int(argv_list[argv_list.index("-n") + 1])
+                if "-n" in argv_list
+                else 2 * len(list(source.glob("*.png")))
+            )
+            for number in range(1, count + 1):
+                (dest / f"{number:08d}.png").write_bytes(b"fake")
+        elif "realesrgan" in bin_name:
             if "-o" in argv_list:
                 out_dir = Path(argv_list[argv_list.index("-o") + 1])
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -95,8 +105,13 @@ class FakeProcessRunner:
                 last.write_bytes(b"")
             elif "%08d.png" in str(last):
                 last.parent.mkdir(parents=True, exist_ok=True)
-                (last.parent / "00000000.png").write_bytes(b"")
-                (last.parent / "00000001.png").write_bytes(b"")
+                count = (
+                    int(argv_list[argv_list.index("-frames:v") + 1])
+                    if "-frames:v" in argv_list
+                    else 2
+                )
+                for i in range(count):
+                    (last.parent / f"{i:08d}.png").write_bytes(b"frame")
             # `-f null -` (vidstabdetect 1st pass) は何も生成しないが OK
 
         return 0

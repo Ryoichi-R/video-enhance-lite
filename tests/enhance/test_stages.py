@@ -86,16 +86,18 @@ def test_pre_filter_chain_all_disabled_returns_empty():
 def test_pre_filter_chain_deinterlace_only():
     decs = _all({"deinterlace": _dec("deinterlace", enabled=True)})
     chain = stages.build_pre_filter_chain(decs)
-    assert chain == "yadif=0"
+    assert chain == ""
 
 
-def test_pre_filter_chain_deinterlace_never_doubles_frames():
-    """P0-2 回帰: yadif=1 (send_field) はフレーム数を倍化させ、固定 framerate の mux で
-    2 倍スロー + 音ズレを起こす (実機確認済み)。send_frame (yadif=0) 固定であること。"""
-    decs = _all({"deinterlace": _dec("deinterlace", enabled=True)})
-    chain = stages.build_pre_filter_chain(decs)
-    assert "yadif=1" not in chain
-    assert "yadif=0" in chain
+@pytest.mark.parametrize(
+    "field,parity",
+    [("tt", "tff"), ("bb", "bff"), ("bt", "tff"), ("tb", "bff"), ("unknown", "auto")],
+)
+def test_decode_field_order(field, parity):
+    args = stages.build_extract_args(
+        Path("ffmpeg"), Path("in.mp4"), 0, 1, Path("out"), field_order=field
+    )
+    assert args[args.index("-vf") + 1] == f"yadif=0:parity={parity}"
 
 
 def test_pre_filter_chain_full_order():
@@ -110,14 +112,11 @@ def test_pre_filter_chain_full_order():
     )
     chain = stages.build_pre_filter_chain(decs, transforms_path=Path(r"C:\tmp\t.trf"))
     parts = chain.split(",")
-    # 順序: deinterlace -> stabilize(format=yuv420p + vidstabtransform) -> deflicker -> denoise -> debanding
-    # stabilize は rgb24 segfault 回避のため format=yuv420p を前置するので 2 要素になる
-    assert parts[0] == "yadif=0"
-    assert parts[1] == f"format={stages.STABILIZE_PIXFMT}"
-    assert parts[2].startswith("vidstabtransform=")
-    assert parts[3].startswith("deflicker=")
-    assert parts[4].startswith("hqdn3d=")
-    assert parts[5].startswith("deband=")
+    assert parts[0] == f"format={stages.STABILIZE_PIXFMT}"
+    assert parts[1].startswith("vidstabtransform=")
+    assert parts[2].startswith("deflicker=")
+    assert parts[3].startswith("hqdn3d=")
+    assert parts[4].startswith("deband=")
 
 
 def test_pre_filter_chain_stabilize_without_transforms_path_omits():
@@ -404,7 +403,10 @@ def test_build_extract_args_normalizes_vfr_before_existing_filter_chain(tmp_path
         expected_frame_count=60,
     )
 
-    assert argv[argv.index("-vf") + 1] == "fps=30000/1001,format=rgb24"
+    assert (
+        argv[argv.index("-vf") + 1]
+        == "setpts=PTS-STARTPTS,fps=30000/1001,trim=start_pts=300:end_pts=360,setpts=PTS-STARTPTS,format=rgb24"
+    )
     assert argv[argv.index("-fps_mode") + 1] == "cfr"
     assert argv[argv.index("-frames:v") + 1] == "60"
 

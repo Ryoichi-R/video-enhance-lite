@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import collections
+import errno
 import json
 import math
-import shutil
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from . import config
+from . import color, config
 from .deps import MissingDependencyError
 from .media_streams import MediaStreamInfo
 
@@ -78,6 +79,15 @@ class VideoMetadata:
     preserved_streams_start_offset_sec: float | None = None
     # True when FFmpeg rebases timestamps on the streams a command uses.
     per_stream_timestamp_rebase: bool = False
+    frame_count: int | None = None
+    sample_aspect_ratio: Fraction | None = None
+    color_primaries: str = "unknown"
+    color_transfer: str = "unknown"
+    bit_depth: int | None = None
+    peak_nits: float | None = None
+    video_start_sec: float = 0.0
+    keyframe_times: tuple[float, ...] = ()
+    title: str | None = None
 
 
 FaceCandidateConfidence = Literal["high", "medium", "low", "unknown"]
@@ -121,6 +131,7 @@ class FrameStats:
     highfreq_energy: float
     sample_count: int
     face_restore_candidates: tuple[FaceRestoreCandidateRange, ...] = field(default_factory=tuple)
+    sample_dir: Path | None = None
 
 
 _FACE_CASCADE_LOCK = threading.Lock()
@@ -207,6 +218,15 @@ def _run(
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, argv, stdout, stderr)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _pixel_depth(fmt: str) -> int | None:
+    match = re.search(r"(9|10|12|14|16)(?:be|le)$", fmt)
+    if match:
+        return int(match.group(1))
+    if fmt.startswith(("yuv", "gbr", "rgb", "bgr", "gray", "nv12", "nv21")):
+        return 8
+    return None
 
 
 def _parse_rate(rate: str | None) -> Fraction | None:
@@ -463,9 +483,10 @@ def probe_metadata(
         "v:0",
         "-show_entries",
         "stream=index,width,height,r_frame_rate,avg_frame_rate,duration,start_time,codec_name,"
-        "bit_rate,pix_fmt,color_range,color_space,field_order:"
-        "format=duration,start_time,bit_rate,format_name:"
-        "stream_side_data=rotation:stream_tags=rotate",
+        "bit_rate,pix_fmt,color_range,color_space,field_order,nb_frames,sample_aspect_ratio,"
+        "color_transfer,color_primaries,bits_per_raw_sample:"
+        "format=duration,start_time,bit_rate,format_name:format_tags=title:"
+        "stream_side_data=rotation,max_content,max_luminance:stream_tags=rotate",
         "-of",
         "json",
         str(input_path),
@@ -498,8 +519,12 @@ def probe_metadata(
             break
     if rotation is None or not math.isfinite(rotation):
         raise AnalyzerError("invalid video rotation")
+    sar = _parse_rate(str(s.get("sample_aspect_ratio", "")).replace(":", "/"))
+    if sar is not None and sar <= 0:
+        sar = None
     if any(math.isclose(rotation % 360, angle, abs_tol=0.001) for angle in (90, 270)):
         width, height = height, width
+        sar = 1 / sar if sar else None
 
     r_rate = _parse_rate(s.get("r_frame_rate"))
     if r_rate is None or r_rate <= 0:
@@ -618,6 +643,75 @@ def probe_metadata(
         else 0.0,
     )
 
+    frame_count = _parse_int(s.get("nb_frames"))
+    keyframe_times = ()
+
+    def timeline_probe(args: list[str]) -> str:
+        try:
+            return _run(
+                [str(ffprobe), "-v", "error", "-select_streams", "v:0", *args, str(input_path)],
+                cancel_event=cancel_event,
+                timeout=max(120, duration),
+            ).stdout
+        except (subprocess.CalledProcessError, OSError) as exc:
+            raise AnalyzerError(
+                f"ffprobe frame properties failed: {getattr(exc, 'stderr', '') or exc}"
+            ) from exc
+
+    if framerate_status == "cfr" and not frame_count and format_names:
+        # Some containers omit nb_frames. Count decoded frames only for those.
+        count_data = json.loads(
+            timeline_probe(
+                ["-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "json"]
+            )
+        )
+        frame_count = _parse_int((count_data.get("streams") or [{}])[0].get("nb_read_frames"))
+        if not frame_count:
+            raise AnalyzerError("cannot determine decoded CFR frame count")
+    if (
+        framerate_status == "vfr_suspected"
+        and format_names
+        and not format_names & _PER_STREAM_REBASE_FORMATS
+    ):
+        lines = timeline_probe(
+            [
+                "-skip_frame",
+                "nokey",
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "csv=p=0",
+            ]
+        ).splitlines()
+        keyframe_times = tuple(
+            sorted(
+                t - (video_start or 0)
+                for line in lines
+                if (t := _parse_float(line.split(",")[0])) is not None and math.isfinite(t)
+            )
+        )
+    peak = None
+    if s.get("color_transfer") in ("smpte2084", "arib-std-b67"):
+        data = timeline_probe(
+            [
+                "-read_intervals",
+                "%+#32",
+                "-show_frames",
+                "-show_entries",
+                "frame_side_data=max_content,max_luminance",
+                "-of",
+                "json",
+            ]
+        )
+        frames = json.loads(data).get("frames", [])
+        entries = list(s.get("side_data_list", []))
+        entries.extend(entry for frame in frames for entry in frame.get("side_data_list", []))
+        for key in ("max_content", "max_luminance"):
+            values = [_parse_rate(str(entry.get(key, ""))) for entry in entries]
+            if valid := [value for value in values if value and 0 < value <= 10000]:
+                peak = float(max(valid))
+                break
     return VideoMetadata(
         width=width,
         height=height,
@@ -634,6 +728,15 @@ def probe_metadata(
         framerate_status=framerate_status,
         primary_video_index=primary_video_index,
         streams=tuple(inventory),
+        frame_count=frame_count,
+        sample_aspect_ratio=sar,
+        color_transfer=str(s.get("color_transfer") or "unknown"),
+        color_primaries=str(s.get("color_primaries") or "unknown"),
+        bit_depth=_parse_int(s.get("bits_per_raw_sample")) or _pixel_depth(pix_fmt),
+        peak_nits=peak,
+        video_start_sec=video_start or 0.0,
+        keyframe_times=keyframe_times,
+        title=next((v for k, v in (fmt.get("tags") or {}).items() if k.lower() == "title"), None),
         container_duration_sec=float(format_duration),
         video_start_offset_sec=float(video_start_offset),
         preserved_streams_start_offset_sec=preserved_streams_start_offset,
@@ -740,6 +843,7 @@ def _extract_samples_one_pass(
     paths: list[Path],
     cancel_event: threading.Event | None,
     progress: Callable[[int, int], None] | None,
+    color_filter: str = "",
 ) -> None:
     # Share one decode across sample branches. Each branch emits a seed at
     # frame zero to initialize its encoder immediately, then its actual sample.
@@ -747,8 +851,9 @@ def _extract_samples_one_pass(
     # initialized its output. Independent branches also preserve duplicates
     # when multiple sample times land in the same frame interval.
     count = len(paths)
+    pre = color_filter + "," if color_filter else ""
     graph = (
-        f"[0:v:0]setpts=PTS-STARTPTS,split={count + 1}[scan]"
+        f"[0:v:0]{pre}setpts=PTS-STARTPTS,split={count + 1}[scan]"
         + "".join(f"[s{i}]" for i in range(count))
         + ";"
         + ";".join(
@@ -824,6 +929,7 @@ def _extract_samples(
     warning: Callable[[str], None] | None = None,
     start_offset_sec: float = 0.0,
     per_stream_timestamp_rebase: bool = False,
+    color_filter: str = "",
 ) -> list[Path]:
     if sample_count < 2:
         raise ValueError(f"sample_count must be >= 2, got {sample_count}")
@@ -835,7 +941,13 @@ def _extract_samples(
     if decode_seek:
         try:
             _extract_samples_one_pass(
-                ffmpeg, input_path, duration_sec, paths, cancel_event, progress
+                ffmpeg,
+                input_path,
+                duration_sec,
+                paths,
+                cancel_event,
+                progress,
+                **({"color_filter": color_filter} if color_filter else {}),
             )
         except subprocess.CalledProcessError as exc:
             raise AnalyzerError(f"ffmpeg sample extract failed: {exc.stderr or exc}") from exc
@@ -859,6 +971,7 @@ def _extract_samples(
                 "1",
                 "-f",
                 "image2",
+                *(["-vf", color_filter] if color_filter else []),
                 str(out_path),
             ]
             try:
@@ -1149,6 +1262,7 @@ def analyze(
     *,
     sample_dir: Path | None = None,
     keep_samples: bool = False,
+    hdr_to_sdr: bool = False,
     warning: Callable[[str], None] | None = None,
 ) -> tuple[VideoMetadata, FrameStats]:
     """Probe metadata then sample frames and compute FrameStats.
@@ -1161,8 +1275,30 @@ def analyze(
     if cancel_event is not None and cancel_event.is_set():
         raise AnalyzerError("cancelled after probe")
 
+    sample_filter = ""
+    if not color.hdr_name(meta) or hdr_to_sdr:
+        try:
+            plan = color.conversion(meta, hdr_to_sdr)
+            sample_filter = plan.extract
+            if color.hdr_name(meta):
+                _run(color.probe_args(ffmpeg, input_path, plan), cancel_event=cancel_event)
+        except (ValueError, subprocess.CalledProcessError) as exc:
+            raise AnalyzerError(
+                f"HDR/SDR sample conversion failed (zscale/tonemap): {getattr(exc, 'stderr', '') or exc}"
+            ) from exc
     sd = sample_dir if sample_dir is not None else (config.derive_temp_dir(input_path) / "analyze")
-    sd.mkdir(parents=True, exist_ok=True)
+    sd.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            sd.mkdir()
+            break
+        except FileExistsError:
+            try:
+                sd = Path(tempfile.mkdtemp(prefix="samples-", dir=sd))
+            except FileNotFoundError:
+                continue  # The creator just removed its empty directory.
+            break
+    owned: set[Path] = set()
     try:
         # Do not request more timestamps than the nominal number of frames.
         # On a low-fps/short clip, several targets could otherwise fall after
@@ -1170,6 +1306,7 @@ def analyze(
         # error. Retain the minimum of two and the final-sample warning policy.
         nominal_frames = max(2, int(meta.duration_sec * float(meta.avg_fps or meta.fps) + 1e-6))
         effective_sample_count = min(max(2, int(sample_count)), nominal_frames)
+        owned.update(sd / f"sample_{i:04d}.png" for i in range(effective_sample_count))
         sample_paths = _extract_samples(
             ffmpeg=ffmpeg,
             input_path=input_path,
@@ -1181,7 +1318,9 @@ def analyze(
             warning=warning,
             start_offset_sec=meta.video_start_offset_sec,
             per_stream_timestamp_rebase=meta.per_stream_timestamp_rebase,
+            **({"color_filter": sample_filter} if sample_filter else {}),
         )
+        owned.update(sample_paths)
         frames: list[Any] = []
         timestamped_frames: list[tuple[float, Any]] = []
         for index, p in enumerate(sample_paths):
@@ -1200,9 +1339,17 @@ def analyze(
             duration_sec=meta.duration_sec,
             sample_count=effective_sample_count,
         )
-        stats = replace(stats, face_restore_candidates=face_candidates)
+        stats = replace(
+            stats, face_restore_candidates=face_candidates, sample_dir=sd if keep_samples else None
+        )
     finally:
         if not keep_samples:
-            shutil.rmtree(sd, ignore_errors=True)
+            for sample in owned:
+                sample.unlink(missing_ok=True)
+            try:
+                sd.rmdir()
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise
 
     return meta, stats

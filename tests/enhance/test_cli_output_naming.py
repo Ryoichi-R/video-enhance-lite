@@ -195,3 +195,15 @@ def test_explicit_output_directory_avoids_existing_file(monkeypatch, tmp_path):
     )
     assert rc == 0
     assert captured["output_path"] == out_dir / "clip_1920x1080-60p~(1).mp4"
+
+
+def test_hdr_default_stop_analysis_and_opt_in(monkeypatch, tmp_path):
+    meta = FakeMeta()
+    meta.color_transfer = "smpte2084"
+    src, captured = _patch(monkeypatch, tmp_path, meta)
+    opts = [str(src), "--auto-all", "--max-temp-gib", "100000"]
+    assert cli.main(opts) == 2 and not captured
+    assert cli.main(opts + ["--analyze-only"]) == 0 and not captured
+    assert cli.main(opts + ["--hdr-to-sdr", "-o", str(tmp_path / "o.MP4")]) == 0
+    assert captured["hdr_to_sdr"] and captured["output_path"].suffix == ".MP4"
+    assert cli.main(opts + ["-o", str(tmp_path / "bad.webm")]) == 2

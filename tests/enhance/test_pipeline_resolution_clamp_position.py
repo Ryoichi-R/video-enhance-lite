@@ -96,7 +96,7 @@ def test_clamp_runs_when_intermediate_differs_from_target(workspace, fake_run):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=Path(r"C:\bin\realesrgan-ncnn-vulkan.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
     clamp = _clamp_calls(fake_run.calls)
     assert len(clamp) == 1
@@ -128,7 +128,7 @@ def test_clamp_flags_bicubic_propagates_to_ffmpeg(workspace, fake_run):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=Path(r"C:\bin\realesrgan-ncnn-vulkan.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
         clamp_flags="bicubic",
     )
     vf_calls = [
@@ -162,7 +162,7 @@ def test_clamp_skipped_when_intermediate_equals_target(workspace, fake_run):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=Path(r"C:\bin\realesrgan-ncnn-vulkan.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
     clamp = _clamp_calls(fake_run.calls)
     assert len(clamp) == 0

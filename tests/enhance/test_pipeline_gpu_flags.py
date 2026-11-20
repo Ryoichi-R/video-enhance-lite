@@ -10,7 +10,6 @@ from tests.enhance.test_pipeline import FakeMeta, _make_decisions  # noqa: F401
 
 
 _REALESRGAN = Path(r"C:\bin\realesrgan-ncnn-vulkan.exe")
-_RIFE = Path(r"C:\bin\rife-ncnn-vulkan.exe")
 
 
 def _run(workspace, fake_run, **kw):
@@ -26,7 +25,7 @@ def _run(workspace, fake_run, **kw):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=_REALESRGAN,
-        rife=_RIFE,
+        rife=workspace / "rife-ncnn-vulkan.exe",
         **kw,
     )
 

@@ -87,12 +87,18 @@ def validate_output_path(output_path: Path) -> Path:
         raise ValueError(f"cannot resolve output path: {output_path}") from e
 
 
+def require_mp4_output(path: Path) -> None:
+    if path.suffix.lower() != ".mp4":
+        raise ValueError(f"MP4 output requires a .mp4 extension: {path}")
+
+
 def prepare_output_path(output_path: Path) -> Path:
     """Create and test the destination directory before expensive processing.
 
     Probe with a separate temporary file; never truncate an existing output.
     Analysis-only callers must continue to use validate_output_path instead.
     """
+    require_mp4_output(output_path)
     output_path = validate_output_path(output_path)
     try:
         if output_path.is_dir():
@@ -683,12 +689,17 @@ def make_unique_output_path(path: Path) -> Path:
         index += 1
 
 
+def mp4_output_name(input_path: Path, suffix: str) -> str:
+    return f"{input_path.stem}{suffix}.mp4"
+
+
 def derive_output_path(input_path: Path, explicit: Path | None, suffix: str = "_enhanced") -> Path:
     if explicit is not None:
         if is_output_directory(explicit):
-            return explicit / f"{input_path.stem}{suffix}{input_path.suffix}"
+            return explicit / mp4_output_name(input_path, suffix)
+        require_mp4_output(explicit)
         return explicit
-    return get_default_output_root() / f"{input_path.stem}{suffix}{input_path.suffix}"
+    return get_default_output_root() / mp4_output_name(input_path, suffix)
 
 
 def _hash_input_identity(input_path: Path) -> str:

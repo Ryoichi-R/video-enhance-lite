@@ -564,3 +564,76 @@ def test_analyze_keep_samples(monkeypatch, tmp_path):
     assert sd.exists()
     # ファイルが残っている
     assert any(sd.iterdir())
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_partial_sampling_preserves_other_owners(tmp_path, monkeypatch, existing):
+    from types import SimpleNamespace
+
+    sd = tmp_path / "samples"
+    if existing:
+        sd.mkdir()
+        (sd / "sample_0000.png").write_bytes(b"original")
+    meta = SimpleNamespace(
+        duration_sec=1,
+        avg_fps=30,
+        fps=30,
+        video_start_offset_sec=0,
+        per_stream_timestamp_rebase=False,
+    )
+    monkeypatch.setattr(analyzer, "probe_metadata", lambda *a, **kw: meta)
+
+    def interrupt(out_dir, **kwargs):
+        (out_dir / "sample_0000.png").write_bytes(b"partial")
+        if not existing:
+            (sd / "concurrent-run").mkdir()
+        raise analyzer.AnalyzerError("cancelled")
+
+    monkeypatch.setattr(analyzer, "_extract_samples", interrupt)
+    with pytest.raises(analyzer.AnalyzerError, match="cancelled"):
+        analyzer.analyze(tmp_path / "input", Path("probe"), Path("ffmpeg"), sample_dir=sd)
+    if existing:
+        assert list(sd.iterdir()) == [sd / "sample_0000.png"]
+        assert (sd / "sample_0000.png").read_bytes() == b"original"
+    else:
+        assert list(sd.iterdir()) == [sd / "concurrent-run"]
+
+
+def test_concurrent_analyses_keep_only_their_samples(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.enhance.test_decisions import FakeMeta
+
+    root = tmp_path / "shared"
+    first_sampling = threading.Event()
+    nested_finished = threading.Event()
+    meta = FakeMeta()
+    meta.video_start_offset_sec = 0
+    meta.per_stream_timestamp_rebase = False
+    meta.avg_fps = meta.fps
+    monkeypatch.setattr(analyzer, "probe_metadata", lambda *args, **kwargs: meta)
+
+    def extract(out_dir, **kwargs):
+        import cv2
+
+        p = out_dir / "sample_0000.png"
+        cv2.imwrite(str(p), _gradient_frame())
+        if out_dir == root:
+            first_sampling.set()
+            assert nested_finished.wait(5)
+        return [p]
+
+    monkeypatch.setattr(analyzer, "_extract_samples", extract)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        args = (tmp_path / "input", Path("ffprobe"), Path("ffmpeg"))
+        first = executor.submit(analyzer.analyze, *args, sample_dir=root)
+        assert first_sampling.wait(5)
+        try:
+            _, kept = analyzer.analyze(*args, sample_dir=root, keep_samples=True)
+        finally:
+            nested_finished.set()
+        _, discarded = first.result(timeout=5)
+    assert discarded.sample_dir is None
+    assert kept.sample_dir.parent == root
+    assert list(root.iterdir()) == [kept.sample_dir]
+    assert (kept.sample_dir / "sample_0000.png").stat().st_size > 0

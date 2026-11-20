@@ -97,8 +97,7 @@ def test_run_pipeline_fused_mux_no_postfilter(workspace, fake_run):
     assert len(mux) == 1
     # libx264 が含まれる (encode 引数)
     assert "libx264" in mux[0]
-    # post_filter OFF なので -vf は付かない
-    assert "-vf" not in mux[0]
+    assert "out_color_matrix=bt709" in mux[0][mux[0].index("-vf") + 1]
 
 
 def test_keep_temp_preserves_chunk_intermediate_frames(workspace, fake_run):

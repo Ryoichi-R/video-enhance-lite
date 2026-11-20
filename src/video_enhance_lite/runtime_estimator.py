@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Literal
 
-from . import config, stages
+from . import config, stages, framerate
 from .decisions import StageDecision, compute_output_summary, decisions_by_key
 
 __all__ = [
@@ -124,13 +124,12 @@ def estimate_runtime(
     post_filter_on = any(_enabled(k) for k in stages.POST_FILTER_ORDER)
     clamp_on = summary.resolution_clamp_applied
     face_restore_on = _enabled("face_restore")
-    interpolate_on = _enabled("interpolate")
+    interpolate_on = summary.interpolate_enabled
     enc = by.get("encode")
     mux_on = enc is None or enc.enabled
 
     # ----- フレーム数 / ピクセル比 -----
-    src_fps = float(meta.fps)
-    f_in = max(1, math.ceil(float(meta.duration_sec) * src_fps))
+    f_in = framerate.output_frame_count(meta)
     if interpolate_on and summary.interpolate_multiplier:
         f_out = f_in * int(summary.interpolate_multiplier)
     else:
@@ -157,7 +156,7 @@ def estimate_runtime(
     per_stage["extract"] = f_in * base["extract"] * src_ratio
     if stabilize_on:
         per_stage["stabilize_detect"] = f_in * base["stabilize_detect"] * src_ratio
-    if pre_filter_on:
+    if pre_filter_on or _enabled("deinterlace"):
         per_stage["pre_filter"] = f_in * base["pre_filter"] * src_ratio
     if upscale_on:
         scale = int(by["upscale"].params.get("scale", config.DEFAULT_REALESRGAN_SCALE))
@@ -238,9 +237,9 @@ def estimate_peak_for_decisions(
 
     effective_fps: Fraction | None = None
     if interp_dec is not None and interp_dec.enabled:
-        num = int(interp_dec.params.get("target_fps_num", meta.fps.numerator * 2))
-        den = int(interp_dec.params.get("target_fps_den", meta.fps.denominator))
-        effective_fps = Fraction(num, den)
+        summary = compute_output_summary(meta, decisions)
+        if summary.interpolate_enabled:
+            effective_fps = summary.out_fps
 
     if png_compression_ratio is None:
         if stats is not None:

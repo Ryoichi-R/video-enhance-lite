@@ -145,7 +145,7 @@ def test_run_pipeline_encode_only(workspace, fake_run):
     extract = [
         c
         for c in fake_run.calls
-        if "ffmpeg" in c[0].lower() and "-ss" in c and any("frames_in" in t for t in c)
+        if "ffmpeg" in c[0].lower() and "-frames:v" in c and any("frames_in" in t for t in c)
     ]
     assert len(extract) == 2
     # mux = ffmpeg + chunks/chunk_NNN.mp4 出力
@@ -183,10 +183,11 @@ def test_run_pipeline_normalizes_every_vfr_chunk_to_one_global_frame_budget(
     extracts = [
         call
         for call in fake_run.calls
-        if "-ss" in call and any("frames_in" in token for token in call)
+        if "-frames:v" in call and any("frames_in" in token for token in call)
     ]
     assert len(extracts) == 3
-    assert [call[call.index("-vf") + 1] for call in extracts] == ["fps=30/1"] * 3
+    for call, start in zip(extracts, (0, 300, 600)):
+        assert f"fps=30/1,trim=start_pts={start}:end_pts=" in call[call.index("-vf") + 1]
     counts = [int(call[call.index("-frames:v") + 1]) for call in extracts]
     assert counts == [300, 300, 150]
     assert sum(counts) == round(25.0 * 30.0)
@@ -340,11 +341,11 @@ def test_run_pipeline_with_pre_post_filters(workspace, fake_run):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
     )
-    # pre_filter ffmpeg call exists with yadif=0 + hqdn3d
-    pre = [
-        c for c in fake_run.calls if "-vf" in c and any("yadif=0" in t and "hqdn3d" in t for t in c)
-    ]
-    assert len(pre) == 1
+    extract = _filter_calls_with(fake_run.calls, "yadif=0")
+    pre = _filter_calls_with(fake_run.calls, "hqdn3d")
+    assert len(extract) == len(pre) == 1
+    assert Path(extract[0][-1]).parent.name == "frames_in"
+    assert Path(pre[0][-1]).parent.name == "frames_pre"
     # post_filter ffmpeg call exists with unsharp
     post = _filter_calls_with(fake_run.calls, "unsharp")
     assert len(post) == 1
@@ -366,8 +367,7 @@ def test_cfr_default_keeps_split_extract_and_pre_filter_until_go_gate(workspace,
     split = [
         call
         for call in fake_run.calls
-        if "-vf" in call
-        and any("yadif=0" in token and "format=rgb24" not in token for token in call)
+        if "-vf" in call and any("hqdn3d" in token and "yadif" not in token for token in call)
     ]
     assert len(split) == 1
     assert Path(split[0][-1]).parent.name == "frames_pre"
@@ -390,7 +390,12 @@ def test_experimental_cfr_fuses_extract_and_pre_filter(workspace, fake_run):
     fused = [
         call
         for call in fake_run.calls
-        if "-vf" in call and any("format=rgb24,yadif=0" in token for token in call)
+        if "-vf" in call
+        and any(
+            "yadif=0" in token
+            and token.index("yadif") < token.index("format=rgb24") < token.index("hqdn3d")
+            for token in call
+        )
     ]
     assert len(fused) == 1
     assert Path(fused[0][-1]).parent.name == "frames_pre"
@@ -414,8 +419,7 @@ def test_debug_option_keeps_split_extract_and_pre_filter(workspace, fake_run):
     pre = [
         call
         for call in fake_run.calls
-        if "-vf" in call
-        and any("yadif=0" in token and "format=rgb24" not in token for token in call)
+        if "-vf" in call and any("hqdn3d" in token and "yadif" not in token for token in call)
     ]
     assert len(pre) == 1
     assert Path(pre[0][-1]).parent.name == "frames_pre"
@@ -455,7 +459,7 @@ def test_run_pipeline_with_interpolate(workspace, fake_run):
         log=lambda _: None,
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
     rife = [c for c in fake_run.calls if "rife" in c[0].lower()]
     assert len(rife) == 1
@@ -477,7 +481,7 @@ def test_intermediate_png_stages_use_compression_level(workspace, fake_run):
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=Path(r"C:\bin\realesrgan-ncnn-vulkan.exe"),
-        rife=Path(r"C:\bin\rife-ncnn-vulkan.exe"),
+        rife=workspace / "rife-ncnn-vulkan.exe",
     )
 
     def _has_pair(call, opt, val):
@@ -753,3 +757,58 @@ def test_run_pipeline_keep_temp_preserves(workspace, fake_run):
     )
     tmp_root = config.derive_temp_dir(workspace / "in.mp4")
     assert tmp_root.exists()
+
+
+@pytest.mark.parametrize("damage", ["short", "gap", "empty"])
+def test_rife_partial_sequences_never_publish(workspace, damage):
+    class PartialRunner(FakeProcessRunner):
+        def run_with_progress(self, argv, **kwargs):
+            result = super().run_with_progress(argv, **kwargs)
+            if kwargs["stage"] == "interpolate" and kwargs["chunk_idx"] == 0:
+                dest = Path(argv[argv.index("-o") + 1])
+                if damage == "short":
+                    for i in range(11, 61):
+                        (dest / f"{i:08d}.png").unlink()
+                elif damage == "gap":
+                    (dest / "00000022.png").rename(dest / "00000061.png")
+                else:
+                    (dest / "00000022.png").write_bytes(b"")
+            return result
+
+    with pytest.raises(pipeline.PipelineError, match=r"chunk_0.*expected 60.*missing or empty"):
+        pipeline.run_pipeline(
+            input_path=workspace / "in.mp4",
+            output_path=workspace / "out.mp4",
+            runner=PartialRunner(),
+            decisions=_make_decisions(interpolate=True),
+            meta=FakeMeta(duration_sec=2),
+            chunk_seconds=1,
+            worker_count=2,
+            ffmpeg=Path("ffmpeg"),
+            ffprobe=Path("ffprobe"),
+            rife=workspace / "rife",
+        )
+    assert not (workspace / "out.mp4").exists()
+
+
+def test_direct_ntsc_to_30_never_resolves_rife(workspace, fake_run, monkeypatch):
+    def unexpected():
+        pytest.fail("RIFE resolution for 1x interpolation")
+
+    monkeypatch.setattr(pipeline.deps, "check_rife", unexpected)
+    decs = _make_decisions(interpolate=True)
+    next(d for d in decs if d.key == "interpolate").params.update(
+        target_fps_num=30, target_fps_den=1
+    )
+    pipeline.run_pipeline(
+        input_path=workspace / "in.mp4",
+        output_path=workspace / "out.mp4",
+        runner=fake_run,
+        decisions=decs,
+        meta=FakeMeta(duration_sec=1, fps=Fraction(30000, 1001)),
+        ffmpeg=Path("ffmpeg"),
+        ffprobe=Path("ffprobe"),
+    )
+    assert all("rife" not in cmd[0] for cmd in fake_run.calls)
+    mux = next(cmd for cmd in fake_run.calls if "-framerate" in cmd)
+    assert mux[mux.index("-framerate") + 1] == "30000/1001"

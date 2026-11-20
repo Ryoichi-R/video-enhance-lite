@@ -14,7 +14,6 @@ from tests.enhance.test_pipeline import FakeMeta, _make_decisions  # noqa: F401
 
 # realesrgan / rife を渡しても dep 解決が走らないようにダミーパスを使う
 _REALESRGAN = Path(r"C:\bin\realesrgan-ncnn-vulkan.exe")
-_RIFE = Path(r"C:\bin\rife-ncnn-vulkan.exe")
 
 
 class GpuGateFakeRunner:
@@ -71,7 +70,9 @@ class GpuGateFakeRunner:
                 last.write_bytes(b"")
             elif "%08d.png" in str(last):
                 last.parent.mkdir(parents=True, exist_ok=True)
-                (last.parent / "00000000.png").write_bytes(b"")
+                count = int(argv[argv.index("-frames:v") + 1]) if "-frames:v" in argv else 1
+                for i in range(count):
+                    (last.parent / f"{i:08d}.png").write_bytes(b"frame")
         return 0
 
 
@@ -102,7 +103,7 @@ def _run(
         ffmpeg=Path(r"C:\bin\ffmpeg.exe"),
         ffprobe=Path(r"C:\bin\ffprobe.exe"),
         realesrgan=_REALESRGAN,
-        rife=_RIFE,
+        rife=workspace / "rife-ncnn-vulkan.exe",
         worker_count=worker_count,
         gpu_concurrency=gpu_concurrency,
     )
